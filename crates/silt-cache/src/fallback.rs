@@ -1,6 +1,6 @@
 //! The RPC fallback (PLAN D2): `eth_*` reads pinned to a block hash.
-//! Behind a trait so tests inject an in-memory chain and so the seam
-//! mirrors jab-state's `StateRpc` (PLAN D8).
+//! Behind a trait so tests can inject an in-memory chain and embedders
+//! can bring their own RPC client.
 
 use silt_wire::{Addr, Word};
 

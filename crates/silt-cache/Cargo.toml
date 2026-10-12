@@ -7,7 +7,7 @@ publish.workspace = true
 [features]
 default = []
 # Optional compatibility adapter: yevm Chain impl + overlay() helper.
-# Core crate must keep compiling without it (PLAN D4/D8).
+# Core crate must keep compiling without it (PLAN D4).
 yevm = ["dep:yevm"]
 
 [dependencies]

@@ -1,7 +1,7 @@
 //! silt-cache: a coherent chain-state cache fed by the silt diff stream,
 //! with standard `eth_*` RPC as the always-available fallback (PLAN M2).
 //!
-//! Chain-shaped API (PLAN D8): whole-account reads, storage-slot reads,
+//! Chain-shaped API (PLAN T2.4): whole-account reads, storage-slot reads,
 //! heads, raw blocks — the same semantic surface yevm's `Chain` trait
 //! wants; the optional `yevm` feature ships the 1:1 adapter plus an
 //! `overlay()` helper (`Chain` & `State` walk together).

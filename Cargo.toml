@@ -25,5 +25,5 @@ serde_json = "1"
 async-trait = "0.1"
 toml = "0.9"
 
-# D8/adapter: yevm only behind silt-cache's optional `yevm` feature.
+# Adapter: yevm only behind silt-cache's optional `yevm` feature.
 yevm = { git = "https://github.com/sergey-melnychuk/yevm.git", branch = "main" }

@@ -1,4 +1,4 @@
-//! yevm compatibility adapter (feature `yevm`, PLAN T2.4/D8).
+//! yevm compatibility adapter (feature `yevm`, PLAN T2.4).
 //!
 //! `Chain` and `State` walk together in yevm: this module provides both —
 //! the `Chain` impl over [`Cache`] and [`overlay()`] for the per-sim

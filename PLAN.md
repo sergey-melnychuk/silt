@@ -1,7 +1,6 @@
 # silt — ExEx state-diff feed + chain-state cache
 
-A three-crate workspace, separate from jab and yevm (reth enters nobody's
-tree but the wrapper's):
+A three-crate workspace (reth enters nobody's tree but the wrapper's):
 
 | Crate | What | Depends on |
 |---|---|---|
@@ -48,19 +47,6 @@ yevm's trait. The core crate has **no yevm dependency**.
 - **D7 — The wrapper is a thin pin, not a fork:** stock reth node builder
   + `install_exex`, same CLI/datadir as stock reth; target ≤200 LoC for
   main + glue. Upgrading reth = bump the pin, fix compile, rerun gates.
-- **D8 — Built for the jab-state extraction.** jab's `jab-state` crate
-  (SharedBase, HeadSource, StateRpc) will be extracted into a standalone
-  library later; `silt-cache` is designed as that library's future
-  core, not a sibling to reconcile with. Concretely: the cache's seams
-  mirror jab-state's existing ones one-to-one — Chain-shaped reads ↔
-  `SharedBase`'s `Chain` impl, `heads()` stream ↔ `HeadSource`, the RPC
-  fallback trait ↔ `StateRpc` — and the crate keeps zero jab/yevm/reth
-  dependencies in its core (yevm only behind the adapter feature). The
-  extraction then has two cheap endgames: jab-state is extracted *as*
-  silt-cache plus the event-driven base kept as a second feed
-  implementation behind the same trait, or jab-state lands on top of it.
-  Nothing in this plan may introduce a jab-specific type into the cache's
-  public API.
 
 ## 1. Architecture
 
@@ -188,8 +174,8 @@ observed by a subscriber (dedupe works).
   and `State` always walk together: `impl yevm::Chain for Cache`
   (1:1 over the four reads) **and** an overlay helper `fn overlay(&self) ->
   yevm::Cache` — a fresh per-sim `State` whose misses read through the
-  cache, exactly the SharedBase/overlay pattern, so `Executor::run(tx,
-  head, &mut cache.overlay(), &cache)` works out of the box. Core crate
+  cache, so `Executor::run(tx, head, &mut cache.overlay(), &cache)`
+  works out of the box. Core crate
   still compiles without yevm.
 - **T2.5** Drop-to-cold: on Reorg frame / parent mismatch / `GapTooOld` /
   decode error → clear store, resubscribe at tip, emit `ChainBreak` so the
@@ -201,7 +187,7 @@ observed by a subscriber (dedupe works).
   accounts/slots applied, apply µs), ERROR on every chain break with cause.
 - **T2.7** Config: builder-style `CacheConfig { feed_addr, rpc_url,
   evict_after_blocks, liveness_timeout }` — a plain struct, no file format
-  imposed on embedders (jab will map its own `[node]` section onto it).
+  imposed on embedders.
 
 **Gates:** G2.1 unit fixtures: destroyed account, span fold, zero-write,
 reorg-drop, eviction. G2.2 integration vs `--dev` node: ≥200 mined blocks,
@@ -228,17 +214,6 @@ read served for a new head.
 bytes/block committed to `docs/`. G3.2 mid-window kill/restart of either
 side → degrades and recovers cleanly (no missed-head accounting). G3.3
 runbook reviewed by operator before first run against the production node.
-
-### M4 — jab integration and the jab-state extraction path
-
-Implemented in jab's private tree, tracked here for sequencing (only after
-G3.1): `diff_feed = "exex"` config rung; shadow dual-base window
-(event-driven base serves the pipeline, diff-fed base compared on all
-overlapping keys, 0 mismatches over a soak window); 50-block replay-check
-on the diff-fed base. This milestone is also the extraction rehearsal
-(D8): wiring jab onto the cache's public API is the proof that jab-state
-can be lifted out — any jab-specific type that wants to cross the boundary
-here is a design bug to fix in M2's API, not to accommodate.
 
 ## 4. Feature → milestone matrix
 

@@ -63,8 +63,7 @@ impl Cache {
         )
     }
 
-    /// Dependency-injected variant (tests, embedders with their own RPC —
-    /// the jab-state `StateRpc` seam, PLAN D8).
+    /// Dependency-injected variant (tests, embedders with their own RPC).
     pub fn with_fallback(
         cfg: CacheConfig,
         fallback: Arc<dyn Fallback>,
