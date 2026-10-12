@@ -13,7 +13,7 @@ is drop-to-cold (v0). See `PLAN.md` for the full design and milestones,
 | Crate | What | reth? |
 |---|---|---|
 | `silt-wire` | wire types, postcard codec, framing, handshake | no |
-| `silt-exex` | stock reth + the feed ExEx + TCP publisher | pinned `v2.5.1` |
+| `silt-exex` | stock reth + the feed ExEx + TCP publisher + `silt_multiproof` RPC | pinned `v2.5.1` |
 | `silt-cache` | subscriber, cache, RPC fallback, Chain-shaped API (+ optional `yevm` adapter) | no |
 
 ## Run
@@ -28,6 +28,20 @@ cargo build --release -p silt-exex          # the node wrapper (compiles reth)
 
 # watch + verify the feed against RPC (checks every applied key, pinned):
 cargo run -p silt-cache --example verify -- 127.0.0.1:8585 http://127.0.0.1:8545
+```
+
+Path-directed multiproofs (PLAN D8) — proofs for **pre-hashed** trie keys,
+the read `eth_getProof` cannot express; served on reth's own RPC
+transports whenever `--http`/`--ws`/`--ipc` are enabled:
+
+```sh
+# params: [[hashedAddress, [hashedSlotProbe, ...]], ...], blockHash|null
+curl -s http://127.0.0.1:8545 -H 'content-type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"silt_multiproof",
+  "params":[[["0x<keccak(addr)>",["0x<probe>"]]], null]
+}'
+# -> { "accountSubtree": {"<nibble path hex>": "0x<rlp>", ...},
+#      "storages": {"0x<hashedAddr>": {"root": "0x..", "subtree": {...}}} }
 ```
 
 Embedding the cache:

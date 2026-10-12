@@ -16,4 +16,12 @@ serde.workspace = true
 toml.workspace = true
 
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.1", features = ["full", "cli"] }
-alloy-primitives = "1"
+alloy-primitives = { version = "1", features = ["serde"] }
+
+# silt_multiproof (D8) rides reth's own RPC server; same jsonrpsee minor
+# as the pinned reth so the build shares artifacts.
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+async-trait.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

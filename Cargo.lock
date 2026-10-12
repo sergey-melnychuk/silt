@@ -10290,10 +10290,13 @@ name = "silt-exex"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "async-trait",
  "eyre",
  "futures",
+ "jsonrpsee",
  "reth-ethereum",
  "serde",
+ "serde_json",
  "silt-wire",
  "tokio",
  "toml",

@@ -6,8 +6,10 @@
 
 mod config;
 mod mapping;
+mod rpc;
 mod server;
 
+use crate::rpc::SiltApiServer as _;
 use futures::TryStreamExt;
 use reth_ethereum::EthPrimitives;
 use reth_ethereum::chainspec::{ChainSpec, EthChainSpec};
@@ -25,6 +27,15 @@ fn main() -> eyre::Result<()> {
         let handle = builder
             .node(EthereumNode::default())
             .install_exex("silt", async move |ctx| Ok(run(ctx, cfg)))
+            .extend_rpc_modules(|ctx| {
+                // D8: silt_multiproof rides reth's own RPC transports —
+                // whatever --http/--ws/--ipc enable; no flags, no
+                // endpoint. The feed socket stays push-only.
+                let silt = rpc::SiltRpc::new(ctx.provider().clone());
+                ctx.modules.merge_configured(silt.into_rpc())?;
+                tracing::info!("silt_multiproof registered on configured rpc transports");
+                Ok(())
+            })
             .launch_with_debug_capabilities()
             .await?;
         handle.wait_for_node_exit().await

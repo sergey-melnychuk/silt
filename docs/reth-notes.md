@@ -44,3 +44,33 @@ version the target node runs). File references are into that tag.
   chain.tip().num_hash())` once a notification is durably ours (for silt:
   after the spool write, D5). reth retains un-acked notifications and
   replays them on restart — the publisher dedupes by `(number, hash)`.
+
+## silt_multiproof facts (T1.6 VERIFY, D8)
+
+- **Custom RPC namespaces**: `extend_rpc_modules` on the builder
+  (`crates/node/builder/src/builder/mod.rs:631`, chains after
+  `install_exex` and before `launch_with_debug_capabilities` — the
+  in-repo `examples/node-custom-rpc/src/main.rs` shows the exact
+  pattern). The hook's `RpcContext` exposes the node provider
+  (`crates/node/builder/src/rpc.rs:316`) and
+  `ctx.modules.merge_configured(ext.into_rpc())` merges a jsonrpsee
+  namespace into every configured transport — no `--http.api` listing
+  needed, but no transport flags means the endpoint is simply not served.
+- **jsonrpsee is `0.26.0`** at the pin (workspace `Cargo.toml:582`);
+  generated `...ApiServer` traits are implemented with `#[async_trait]`
+  (reth's own pattern, e.g. `crates/rpc/rpc/src/txpool.rs:78`).
+- **`StateProofProvider::multiproof(TrieInput, MultiProofTargets) ->
+  MultiProof`** (`crates/storage/storage-api/src/trie.rs:159`), reachable
+  from any `StateProviderBox` minted by `StateProviderFactory::latest()` /
+  `state_by_block_hash()` (`crates/storage/storage-api/src/state.rs:150,185`).
+  `MultiProofTargets` is hashed-address → hashed-slot set and derefs to a
+  map (`crates/trie/common/src/proofs.rs:22,43,51`).
+- **Historical blocks work**: `HistoricalStateProviderRef::multiproof`
+  builds a revert overlay before walking
+  (`crates/storage/provider/src/providers/state/historical.rs:580`) —
+  cost grows with distance from tip.
+- **`MultiProof` has no serde** (`proofs.rs:179` derives only
+  Clone/Default/Debug/PartialEq/Eq) — hence silt's own response types.
+  `account_subtree`/`StorageMultiProof::subtree` are `ProofNodes`
+  (path-keyed RLP; `Nibbles::to_vec()` yields one `u8` per nibble,
+  nybbles 0.4.8).

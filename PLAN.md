@@ -47,6 +47,20 @@ yevm's trait. The core crate has **no yevm dependency**.
 - **D7 — The wrapper is a thin pin, not a fork:** stock reth node builder
   + `install_exex`, same CLI/datadir as stock reth; target ≤200 LoC for
   main + glue. Upgrading reth = bump the pin, fix compile, rerun gates.
+- **D8 — Path-directed multiproofs ride reth's RPC server, not the feed.**
+  Resolving a partial trie's stubs (mpt-lab PTRIE.md §8) needs proofs for
+  **pre-hashed** trie keys so the caller can steer the walk to a chosen
+  nibble path; `eth_getProof` keccaks raw keys server-side and so cannot
+  express that read. The wrapper registers `silt_multiproof(targets:
+  [hashedAddress, [hashedSlotProbe]], block?: hash)` via the node
+  builder's `extend_rpc_modules`, backed by in-process
+  `StateProofProvider::multiproof`, returning path-keyed RLP nodes in a
+  reth-free JSON shape (consumers hash-verify every node anyway). It is
+  served on whatever transports reth's own `--http/--ws/--ipc` flags
+  enable — no flags, no endpoint — and the silt feed (D1) stays
+  push-only. State is pinned by block hash (`null` = latest); historical
+  blocks resolve through reth's revert overlay and get costlier with
+  distance from tip, same constraint as `eth_getProof`.
 
 ## 1. Architecture
 
@@ -142,6 +156,10 @@ dep in `wire` on a branch once, watch CI fail, record it).
 - **T1.5** Config: one `silt.toml` section for the wrapper (bind
   address, spool depth, heartbeat period) read next to reth's own flags;
   env-free, secret-free.
+- **T1.6** `silt_multiproof` endpoint (D8): jsonrpsee namespace `silt`
+  merged through `extend_rpc_modules`; the handler clones the node
+  provider and runs the MDBX-walking `multiproof` under
+  `spawn_blocking`, mapping the result to nibble-path-hex → RLP-hex maps.
 
 **Gates:** G1.1 mapping unit tests green on synthetic
 notifications (incl. selfdestruct + span fixtures). G1.2 end-to-end on a
@@ -230,6 +248,7 @@ runbook reviewed by operator before first run against the production node.
 | F9 | Drop-to-cold + eviction | M2 |
 | F10 | Observability (heartbeats, per-block line, break ERRORs) | M1/M2 |
 | F11 | Equivalence verifier + soak | M3 |
+| F12 | Path-directed multiproof RPC (`silt_multiproof`, D8) | M1 |
 
 ## 5. VERIFY before coding (facts, not assumptions)
 
