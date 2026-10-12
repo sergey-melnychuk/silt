@@ -1,0 +1,19 @@
+[package]
+name = "silt-exex"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# The only crate allowed to depend on reth (PLAN D4). Pinned to the exact
+# tag the target node runs; see docs/reth-notes.md for the verified API.
+[dependencies]
+silt-wire.workspace = true
+tokio.workspace = true
+eyre.workspace = true
+tracing.workspace = true
+futures.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.1", features = ["full", "cli"] }
+alloy-primitives = "1"
