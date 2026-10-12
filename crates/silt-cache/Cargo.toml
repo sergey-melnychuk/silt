@@ -1,0 +1,27 @@
+[package]
+name = "silt-cache"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Optional compatibility adapter: yevm Chain impl + overlay() helper.
+# Core crate must keep compiling without it (PLAN D4/D8).
+yevm = ["dep:yevm"]
+
+[dependencies]
+silt-wire.workspace = true
+tokio.workspace = true
+eyre.workspace = true
+tracing.workspace = true
+futures.workspace = true
+dashmap.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tiny-keccak = { version = "2", features = ["keccak"] }
+yevm = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "time", "test-util"] }
