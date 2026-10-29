@@ -66,3 +66,7 @@ let (cache, mut heads) = silt_cache::Cache::connect(cfg);
 
 Feed security model (PLAN D1): no auth/TLS — bind to localhost or a private
 network only.
+
+## Upgrades
+
+- `reth` 2.5.1 -> 2.8.1: In `crates/silt-exex/Cargo.toml` change `reth-ethereum` tag to `v2.8.1`. Then  `cargo update alloy-hardforks alloy-evm` to avoid cargo complains about uncompatible versions of deps.

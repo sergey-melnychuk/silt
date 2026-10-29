@@ -15,7 +15,7 @@ futures.workspace = true
 serde.workspace = true
 toml.workspace = true
 
-reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.1", features = ["full", "cli"] }
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.8.1", features = ["full", "cli"] }
 alloy-primitives = { version = "1", features = ["serde"] }
 
 # silt_multiproof (D8) rides reth's own RPC server; same jsonrpsee minor
