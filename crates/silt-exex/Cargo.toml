@@ -6,6 +6,7 @@ publish.workspace = true
 
 # The only crate allowed to depend on reth (PLAN D4). Pinned to the exact
 # tag the target node runs; see docs/reth-notes.md for the verified API.
+# Bumping the tag: follow README "Upgrades" (root `[patch]`, lock pins).
 [dependencies]
 silt-wire.workspace = true
 tokio.workspace = true
@@ -15,7 +16,7 @@ futures.workspace = true
 serde.workspace = true
 toml.workspace = true
 
-reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.8.1", features = ["full", "cli"] }
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.10.0", features = ["full", "cli"] }
 alloy-primitives = { version = "1", features = ["serde"] }
 
 # silt_multiproof (D8) rides reth's own RPC server; same jsonrpsee minor

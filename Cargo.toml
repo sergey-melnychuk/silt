@@ -27,3 +27,19 @@ toml = "0.9"
 
 # Adapter: yevm only behind silt-cache's optional `yevm` feature.
 yevm = { git = "https://github.com/sergey-melnychuk/yevm.git", branch = "main" }
+
+# Mirrors the `[patch]` section of reth v2.10.0's root Cargo.toml: Cargo
+# ignores a dependency's patches, and without these reth-core resolves from
+# crates.io and reth-trie-common fails to build. Re-sync on every reth bump.
+# (reth's `inkwell` patch is left out: it only feeds evm2-jit, which silt
+# doesn't build, so Cargo would warn "patch not used".)
+[patch."https://github.com/alloy-rs/evm2"]
+evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "592bf18c4e22fff54ac9b4db606c4ee276e345cb" }
+evm2-inspectors = { git = "https://github.com/DaniPopes/evm2", rev = "592bf18c4e22fff54ac9b4db606c4ee276e345cb" }
+
+[patch.crates-io]
+reth-codecs = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-codecs-derive = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-rpc-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-zstd-compressors = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }

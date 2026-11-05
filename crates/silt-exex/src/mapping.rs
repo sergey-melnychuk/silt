@@ -6,9 +6,9 @@
 
 use alloy_primitives::{B256, U256};
 use reth_ethereum::EthPrimitives;
-use reth_ethereum::evm::revm::db::BundleState;
 use reth_ethereum::primitives::AlloyBlockHeader;
 use reth_ethereum::provider::Chain;
+use reth_ethereum::trie::bundle_state::BundleState;
 use silt_wire::{AccountChange, BlockDiff, HeadLite, LogLite, ReceiptLite, Word};
 
 fn word(v: &B256) -> Word {
@@ -121,9 +121,9 @@ pub fn diff_from_chain(chain: &Chain<EthPrimitives>) -> eyre::Result<BlockDiff> 
 mod tests {
     use super::*;
     use alloy_primitives::Address;
-    use reth_ethereum::evm::revm::db::states::StorageSlot;
-    use reth_ethereum::evm::revm::db::{AccountStatus, BundleAccount};
-    use reth_ethereum::evm::revm::state::AccountInfo;
+    // evm2's `AccountInfo`; reth re-exports it only from `reth_evm::cached`.
+    use reth_ethereum::evm::primitives::cached::AccountInfo;
+    use reth_ethereum::trie::bundle_state::{AccountStatus, BundleAccount, StorageSlot};
 
     fn acct(balance: u64, nonce: u64, slots: &[(u64, u64)]) -> BundleAccount {
         BundleAccount {

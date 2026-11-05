@@ -69,4 +69,22 @@ network only.
 
 ## Upgrades
 
-- `reth` 2.5.1 -> 2.8.1: In `crates/silt-exex/Cargo.toml` change `reth-ethereum` tag to `v2.8.1`. Then  `cargo update alloy-hardforks alloy-evm` to avoid cargo complains about uncompatible versions of deps.
+Bumping reth (the `reth-ethereum` tag in `crates/silt-exex/Cargo.toml`):
+
+1. Change the tag.
+2. Diff the `[patch]` section of reth's root `Cargo.toml` at the new tag
+   against silt's root `Cargo.toml` and mirror it — Cargo does not apply a
+   dependency's patches.
+3. If the reth tree itself fails to compile, compare `Cargo.lock` with
+   reth's lockfile at the tag and `cargo update -p <crate> --precise <ver>`
+   the offenders.
+4. `FULL=1 scripts/ci.sh`, then re-verify `docs/reth-notes.md`.
+
+Per-version notes:
+
+- 2.5.1 -> 2.8.1: `cargo update alloy-hardforks alloy-evm` to resolve
+  incompatible dependency versions.
+- 2.8.1 -> 2.10.0: reth now patches evm2 and the reth-core crates (mirrored
+  in the root `Cargo.toml`). `alloy-trie` is pinned to 0.9.8 — 0.9.9 breaks
+  reth-trie-common, and a bare `cargo update` undoes the pin. revm is gone:
+  bundle types moved to `reth_ethereum::trie::bundle_state`.
