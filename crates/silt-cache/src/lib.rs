@@ -5,10 +5,15 @@
 //! heads, raw blocks — the same semantic surface yevm's `Chain` trait
 //! wants; the optional `yevm` feature ships the 1:1 adapter plus an
 //! `overlay()` helper (`Chain` & `State` walk together).
+//!
+//! Misses can take the binary lookup fast path (PLAN D9,
+//! [`CacheConfig::with_lookup`]); JSON-RPC stays the fallback for every
+//! lookup failure.
 
 pub mod cache;
 pub mod client;
 pub mod fallback;
+pub mod lookup;
 pub mod store;
 
 #[cfg(feature = "yevm")]
@@ -18,6 +23,7 @@ use std::sync::Arc;
 
 pub use cache::{Cache, CacheConfig};
 pub use fallback::{Fallback, HttpFallback, RpcAccount};
+pub use lookup::{LookupClient, LookupClientConfig, LookupError, LookupFallback};
 pub use silt_wire::{Addr, HeadLite, Word};
 
 /// What the consumer loop reacts to (PLAN T2.4): heads to process, breaks

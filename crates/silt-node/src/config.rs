@@ -12,6 +12,12 @@ pub struct SiltConfig {
     /// subscribers; older gaps answer `GapTooOld`.
     pub spool: usize,
     pub heartbeat_secs: u64,
+    /// TCP bind address for the lookup fast path (D9); a separate
+    /// listener from the push-only feed. Empty string disables it. Loopback
+    /// by default — the protocol has no auth (D1).
+    pub lookup_bind: String,
+    /// Dedicated OS threads serving lookup reads (D9); never tokio workers.
+    pub lookup_workers: usize,
 }
 
 impl Default for SiltConfig {
@@ -20,6 +26,8 @@ impl Default for SiltConfig {
             bind: "127.0.0.1:8585".into(),
             spool: 128,
             heartbeat_secs: 10,
+            lookup_bind: "127.0.0.1:8586".into(),
+            lookup_workers: 16,
         }
     }
 }
@@ -33,5 +41,26 @@ impl SiltConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_bind_loopback_and_enable_lookup() {
+        let cfg: SiltConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.bind, "127.0.0.1:8585");
+        assert_eq!(cfg.lookup_bind, "127.0.0.1:8586");
+        assert_eq!(cfg.lookup_workers, 16);
+    }
+
+    #[test]
+    fn empty_lookup_bind_disables_and_unknown_fields_fail() {
+        let cfg: SiltConfig = toml::from_str("lookup_bind = \"\"\nspool = 64").unwrap();
+        assert!(cfg.lookup_bind.is_empty());
+        assert_eq!(cfg.spool, 64);
+        assert!(toml::from_str::<SiltConfig>("lookup_port = 1").is_err());
     }
 }

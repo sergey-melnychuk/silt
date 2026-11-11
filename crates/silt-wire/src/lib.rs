@@ -3,10 +3,14 @@
 //! Dependency-free types (PLAN.md D4): raw byte arrays and integers only.
 //! Adapters on each side map to native types (alloy in the wrapper, yevm or
 //! anything else in consumers). Frames are postcard-encoded, length-prefixed
-//! (u32 LE). Version negotiation is exact-match (v0, D1).
+//! (u32 LE). Version negotiation is exact-match (v0, D1). The lookup fast
+//! path (D9) shares the handshake and length prefix but uses a fixed
+//! little-endian layout instead of postcard: see [`lookup`].
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+pub mod lookup;
 
 pub const MAGIC: [u8; 4] = *b"SILT";
 pub const VERSION: u16 = 0;
@@ -16,6 +20,13 @@ pub const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 
 pub type Addr = [u8; 20];
 pub type Word = [u8; 32];
+
+/// keccak256 of the empty string: the code hash of every account without
+/// code. Both protocols use it for "no code", never zero.
+pub const KECCAK_EMPTY: Word = [
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
+];
 
 /// Enough header to pin RPC reads and build a next-block sim environment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

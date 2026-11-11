@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/silt-wire", "crates/silt-cache", "crates/silt-exex"]
-# Plain `cargo build/test` skips the reth-heavy wrapper; scripts/ci.sh
-# builds it explicitly (it pulls the full node tree and takes minutes).
+members = ["crates/silt-wire", "crates/silt-cache", "crates/silt-node", "crates/silt-exex"]
+# Plain `cargo build/test` skips the reth-heavy crates (silt-node, silt-exex);
+# scripts/ci.sh builds them explicitly (the full node tree takes minutes).
 default-members = ["crates/silt-wire", "crates/silt-cache"]
 
 [workspace.package]
@@ -12,6 +12,17 @@ publish = false
 
 [workspace.dependencies]
 silt-wire = { path = "crates/silt-wire" }
+silt-node = { path = "crates/silt-node" }
+
+# The one reth pin (PLAN D4/D7), used only by silt-node and silt-exex. A
+# host node that installs silt-node must build against the same reth, so
+# this follows yevm-node's pin (yevm-reth/Cargo.toml): a reth main rev
+# after v2.10.1 (crates still say 2.10.1). It only moves forward with yevm.
+# Bumping: README "Upgrades" (mirror reth's `[patch]` below, lock pins).
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "46731e939ea81a31fe468378f5344657640da36b" }
+# `StageId::Finish` for the read-only harness's state frontier (D9); in
+# reth's tree at the same rev, not re-exported by reth-ethereum.
+reth-stages-types = { git = "https://github.com/paradigmxyz/reth", rev = "46731e939ea81a31fe468378f5344657640da36b", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
@@ -28,14 +39,14 @@ toml = "0.9"
 # Adapter: yevm only behind silt-cache's optional `yevm` feature.
 yevm = { git = "https://github.com/sergey-melnychuk/yevm.git", branch = "main" }
 
-# Mirrors the `[patch]` section of reth v2.10.0's root Cargo.toml: Cargo
-# ignores a dependency's patches, and without these reth-core resolves from
-# crates.io and reth-trie-common fails to build. Re-sync on every reth bump.
-# (reth's `inkwell` patch is left out: it only feeds evm2-jit, which silt
-# doesn't build, so Cargo would warn "patch not used".)
+# Mirrors the `[patch]` section of reth 46731e9's root Cargo.toml (same as
+# yevm's root Cargo.toml): Cargo ignores a dependency's patches, and without
+# these reth-core resolves from crates.io and reth-trie-common fails to
+# build. Re-sync on every reth bump. (reth's `evm2-jit` patch is left out:
+# silt doesn't build it, so Cargo would warn "patch not used".)
 [patch."https://github.com/alloy-rs/evm2"]
-evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "592bf18c4e22fff54ac9b4db606c4ee276e345cb" }
-evm2-inspectors = { git = "https://github.com/DaniPopes/evm2", rev = "592bf18c4e22fff54ac9b4db606c4ee276e345cb" }
+evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "37fb326b91a76dd07308c703b3f3c85152a6230b" }
+evm2-inspectors = { git = "https://github.com/DaniPopes/evm2", rev = "37fb326b91a76dd07308c703b3f3c85152a6230b" }
 
 [patch.crates-io]
 reth-codecs = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # silt CI: fmt, clippy -D warnings, tests, dependency-boundary checks
 # (PLAN T0.1, G0.3). Default run covers the reth-free members; FULL=1 adds
-# the wrapper (compiles the reth tree — minutes, not seconds).
+# silt-node + the silt-exex wrapper (compiles the reth tree — minutes).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,9 +25,10 @@ if cargo tree -p silt-cache --features yevm --prefix none | awk '{print $1}' | g
   echo "FAIL: silt-cache (+yevm) grew a reth dependency"; exit 1
 fi
 
+# - reth lives only in silt-node (the library) and silt-exex (its host binary).
 if [ "${FULL:-0}" = "1" ]; then
-  cargo clippy -p silt-exex -- -D warnings
-  cargo test -p silt-exex
+  cargo clippy -p silt-node -p silt-exex --all-targets -- -D warnings
+  cargo test -p silt-node -p silt-exex
 fi
 
 echo "CI OK"

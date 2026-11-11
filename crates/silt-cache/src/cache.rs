@@ -23,6 +23,12 @@ pub struct CacheConfig {
     pub evict_after_blocks: u64,
     /// Reconnect if the feed is silent this long (heartbeats come ~10 s).
     pub liveness: Duration,
+    /// Lookup fast path (`host:port`, PLAN D9). `None` = misses go
+    /// straight to JSON-RPC; `Some` = account/storage misses go over the
+    /// lookup protocol, with JSON-RPC as the fallback on any failure (D2).
+    pub lookup_addr: Option<String>,
+    /// Per-request lookup deadline before falling back to RPC.
+    pub lookup_timeout: Duration,
 }
 
 impl CacheConfig {
@@ -32,11 +38,25 @@ impl CacheConfig {
             rpc_url: rpc_url.into(),
             evict_after_blocks: 64,
             liveness: Duration::from_secs(30),
+            lookup_addr: None,
+            lookup_timeout: Duration::from_millis(500),
         }
     }
 
     pub fn with_feed(mut self, addr: impl Into<String>) -> Self {
         self.feed_addr = Some(addr.into());
+        self
+    }
+
+    /// Sends account/storage misses over the lookup fast path (D9), e.g.
+    /// `127.0.0.1:8586`; JSON-RPC answers whenever it can't.
+    pub fn with_lookup(mut self, addr: impl Into<String>) -> Self {
+        self.lookup_addr = Some(addr.into());
+        self
+    }
+
+    pub fn with_lookup_timeout(mut self, timeout: Duration) -> Self {
+        self.lookup_timeout = timeout;
         self
     }
 }
@@ -57,10 +77,17 @@ impl Cache {
     /// Builds the cache, spawns the feed client (if configured) and the
     /// eviction sweep; returns the handle plus the head-event stream.
     pub fn connect(cfg: CacheConfig) -> (Arc<Self>, UnboundedReceiver<HeadEvent>) {
-        Self::with_fallback(
-            cfg.clone(),
-            Arc::new(crate::fallback::HttpFallback::new(cfg.rpc_url)),
-        )
+        let rpc: Arc<dyn Fallback> =
+            Arc::new(crate::fallback::HttpFallback::new(cfg.rpc_url.clone()));
+        let fallback = match &cfg.lookup_addr {
+            Some(addr) => {
+                let lookup = crate::lookup::LookupClientConfig::new(addr.clone())
+                    .with_timeout(cfg.lookup_timeout);
+                Arc::new(crate::lookup::LookupFallback::new(lookup, rpc)) as Arc<dyn Fallback>
+            }
+            None => rpc,
+        };
+        Self::with_fallback(cfg, fallback)
     }
 
     /// Dependency-injected variant (tests, embedders with their own RPC).
