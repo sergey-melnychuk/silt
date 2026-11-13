@@ -3098,7 +3098,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5456,7 +5456,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6475,7 +6475,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9655,7 +9655,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9735,7 +9735,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 1.0.11",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10834,7 +10834,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11756,7 +11756,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -12216,7 +12216,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 [[package]]
 name = "yevm"
 version = "0.1.0"
-source = "git+https://github.com/sergey-melnychuk/yevm.git?branch=main#8464ea20dc7ef0512c2bc08698fdc02bd056262a"
+source = "git+https://github.com/sergey-melnychuk/yevm.git?branch=main#b73b0f68a61da988b5a5a7b0156cec18c868d0b9"
 dependencies = [
  "yevm-base",
  "yevm-core",
@@ -12228,7 +12228,7 @@ dependencies = [
 [[package]]
 name = "yevm-base"
 version = "0.1.0"
-source = "git+https://github.com/sergey-melnychuk/yevm.git?branch=main#8464ea20dc7ef0512c2bc08698fdc02bd056262a"
+source = "git+https://github.com/sergey-melnychuk/yevm.git?branch=main#b73b0f68a61da988b5a5a7b0156cec18c868d0b9"
 dependencies = [
  "hex",
  "ruint",
@@ -12238,9 +12238,8 @@ dependencies = [
 [[package]]
 name = "yevm-core"
 version = "0.1.0"
-source = "git+https://github.com/sergey-melnychuk/yevm.git?branch=main#8464ea20dc7ef0512c2bc08698fdc02bd056262a"
+source = "git+https://github.com/sergey-melnychuk/yevm.git?branch=main#b73b0f68a61da988b5a5a7b0156cec18c868d0b9"
 dependencies = [
- "ahash",
  "alloy-eip7702",
  "alloy-primitives",
  "ark-bls12-381 0.5.0",
@@ -12249,6 +12248,7 @@ dependencies = [
  "async-trait",
  "ethnum",
  "eyre",
+ "foldhash 0.2.0",
  "futures",
  "hex",
  "k256 0.13.4",
@@ -12270,7 +12270,7 @@ dependencies = [
 [[package]]
 name = "yevm-lens"
 version = "0.1.0"
-source = "git+https://github.com/sergey-melnychuk/yevm.git?branch=main#8464ea20dc7ef0512c2bc08698fdc02bd056262a"
+source = "git+https://github.com/sergey-melnychuk/yevm.git?branch=main#b73b0f68a61da988b5a5a7b0156cec18c868d0b9"
 dependencies = [
  "hex",
  "serde",
@@ -12282,7 +12282,7 @@ dependencies = [
 [[package]]
 name = "yevm-misc"
 version = "0.1.0"
-source = "git+https://github.com/sergey-melnychuk/yevm.git?branch=main#8464ea20dc7ef0512c2bc08698fdc02bd056262a"
+source = "git+https://github.com/sergey-melnychuk/yevm.git?branch=main#b73b0f68a61da988b5a5a7b0156cec18c868d0b9"
 dependencies = [
  "eyre",
  "keccak-asm",
@@ -12295,7 +12295,7 @@ dependencies = [
 [[package]]
 name = "yevm-wasm"
 version = "0.1.0"
-source = "git+https://github.com/sergey-melnychuk/yevm.git?branch=main#8464ea20dc7ef0512c2bc08698fdc02bd056262a"
+source = "git+https://github.com/sergey-melnychuk/yevm.git?branch=main#b73b0f68a61da988b5a5a7b0156cec18c868d0b9"
 dependencies = [
  "eyre",
  "futures",
