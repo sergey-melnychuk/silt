@@ -142,6 +142,58 @@ for fresh cold keys. Matches the v2.10.0 run within this machine's noise:
 
 baseline: pinned eth_* JSON-RPC, sequential, same recent keys (account = 3 calls): 300 reads, µs p50/p99/p999 431 / 938 / 1263
 
+## In the node (2026-11-13)
+
+The same `lookup-bench` against the live node's own lookup listener
+(`127.0.0.1:8586`): the node now runs silt-node (yevm-node `b73b0f6`,
+reth `46731e9`, 16 read workers), so these are the numbers a client of the
+running node sees. Pin `latest` reads at the node's head, through reth's
+in-memory overlay of not-yet-persisted blocks. `--server-pid` is the node
+itself, so the disk column counts the node's reads during each pass.
+Client on a current-thread runtime, `--old-offset 15000` (keys never
+touched by earlier runs); tip at start 26408706.
+
+| pool | pass | mode | requests | keys | keys/s | round trip µs p50/p99/p999 | server µs p50/p99/p999 | transport µs p50/p99/p999 | server disk reads (MiB / major faults) | errors |
+|---|---|---|---:|---:|---:|---|---|---|---:|---:|
+| recent | first touch | single, sequential | 1000 | 1000 | 4763 | 149 / 1827 / 2365 | 53 / 1255 / 1965 | 85 / 658 / 2186 | 0.5 / 78 | 0 |
+| recent | warm | single, sequential | 1000 | 1000 | 6959 | 118 / 310 / 1393 | 45 / 107 / 174 | 70 / 253 / 1331 | 0.0 / 4 | 0 |
+| recent | first touch | single, 16 in flight | 2000 | 2000 | 69753 | 148 / 1484 / 2296 | 39 / 1392 / 2115 | 99 / 249 / 287 | 0.9 / 184 | 0 |
+| recent | warm | single, 16 in flight | 2000 | 2000 | 108653 | 117 / 174 / 243 | 25 / 60 / 80 | 90 / 144 / 176 | 0.0 / 0 | 0 |
+| recent | first touch | single, 256 in flight | 4000 | 4000 | 168781 | 821 / 4979 / 8280 | 59 / 1379 / 2637 | 677 / 4829 / 8142 | 1.7 / 294 | 0 |
+| recent | warm | single, 256 in flight | 4000 | 4000 | 147424 | 1384 / 3268 / 3293 | 34 / 471 / 510 | 1341 / 3243 / 3268 | 0.0 / 1 | 0 |
+| recent | first touch | batch of 16 | 129 | 2048 | 50247 | 160 / 1647 / 1829 | 98 / 1154 / 1555 | 50 / 601 / 1690 | 0.3 / 69 | 0 |
+| recent | warm | batch of 16 | 129 | 2048 | 83525 | 158 / 438 / 693 | 97 / 222 / 272 | 56 / 274 / 562 | 0.0 / 0 | 0 |
+| recent | first touch | batch of 256 | 17 | 4096 | 52190 | 4568 / 8953 / 8953 | 4353 / 6910 / 6910 | 295 / 2486 / 2486 | 0.5 / 120 | 0 |
+| recent | warm | batch of 256 | 17 | 4096 | 139416 | 1641 / 3584 / 3584 | 1326 / 2167 / 2167 | 333 / 1668 / 1668 | 0.0 / 0 | 0 |
+| old | first touch | single, sequential | 1000 | 1000 | 1132 | 769 / 3187 / 5588 | 523 / 2319 / 2773 | 237 / 1997 / 4851 | 4.3 / 1046 | 0 |
+| old | warm | single, sequential | 1000 | 1000 | 5944 | 124 / 861 / 5147 | 44 / 140 / 202 | 77 / 718 / 5065 | 0.0 / 0 | 0 |
+| old | first touch | single, 16 in flight | 2000 | 2000 | 29020 | 471 / 2322 / 3255 | 409 / 2183 / 2869 | 47 / 837 / 1139 | 8.1 / 1967 | 0 |
+| old | warm | single, 16 in flight | 2000 | 2000 | 99897 | 110 / 795 / 2183 | 25 / 82 / 109 | 82 / 714 / 2136 | 0.0 / 0 | 0 |
+| old | first touch | single, 256 in flight | 4000 | 4000 | 33613 | 7147 / 10373 / 11369 | 7080 / 10302 / 11322 | 48 / 1086 / 1688 | 15.9 / 3799 | 0 |
+| old | warm | single, 256 in flight | 4000 | 4000 | 138877 | 1422 / 3688 / 3930 | 46 / 355 / 380 | 1358 / 3638 / 3843 | 0.0 / 0 | 0 |
+| old | first touch | batch of 16 | 129 | 2048 | 3264 | 5034 / 11153 / 30388 | 4813 / 10786 / 29173 | 239 / 1274 / 2649 | 6.8 / 1749 | 0 |
+| old | warm | batch of 16 | 129 | 2048 | 54278 | 262 / 651 / 1336 | 137 / 269 / 323 | 124 / 426 / 1221 | 0.0 / 0 | 0 |
+| old | first touch | batch of 256 | 17 | 4096 | 4083 | 75822 / 85846 / 85846 | 75601 / 85533 / 85533 | 311 / 1737 / 1737 | 13.9 / 3546 | 0 |
+| old | warm | batch of 256 | 17 | 4096 | 153537 | 1549 / 2050 / 2050 | 1252 / 1860 / 1860 | 247 / 362 / 362 | 0.0 / 0 | 0 |
+
+baseline: pinned eth_* JSON-RPC, sequential, same recent keys (account = 3 calls): 300 reads, µs p50/p99/p999 357 / 1534 / 2403
+
+- **Warm single lookups cost about twice the harness.** Sequential p50
+  118 µs (server 45, transport 70) against 54 µs (21 / 33) through
+  `lookup-ro`. The server now shares the machine's 16 cores with a node
+  importing and persisting blocks, and a tip read resolves through reth's
+  in-memory blocks before the database. p99 stays at 0.3 ms.
+- **Recent keys are cheaper on first touch.** p50 149 µs against 303 µs,
+  with 0.5 MiB of disk reads against 3.3 MiB: state the newest blocks
+  touched is already in the node's caches and the page cache. A cold
+  batch of 256 recent keys takes 4.6 ms against 38 ms.
+- **Cold keys are disk-bound either way.** Keys from 15,000 blocks back:
+  first-touch p50 769 µs (harness 772 µs), and batches still serialize the
+  disk on one worker (a cold batch of 256: 76 ms).
+- **16 in flight remains the sweet spot:** warm p50/p99 117 / 174 µs at
+  109k keys/s on one connection, the same as through the harness. 256 in
+  flight is again bound by the single-threaded client.
+
 ## Verification (`lookup-verify`, G4.4)
 
 Every key read over the lookup protocol vs the node's `eth_getBalance` /
@@ -159,6 +211,14 @@ done at block 26386303: 5661 accounts (1470 with code, 13 absent, 0 item errors)
 
 **0 mismatches** in all four runs (two on v2.10.0, one on v2.10.1, one on
 `46731e9`, the rev yevm-node pins and the node runs).
+
+In the node (`--lookup 127.0.0.1:8586`), after each restart onto a silt
+build of yevm-node (2026-11-13):
+
+```
+done at block 26408064: 5574 accounts (1618 with code, 14 absent, 0 item errors), 1136 code hashes, 2447 slots (2041 non-zero); keys checked 8021; unknown pin -> UnknownBlock: true; proofs at head 26408065: 173 accounts, 120 slots, 1531 account-proof nodes and 494 storage-proof nodes found in op 4, root ok: true; mismatches 0
+done at block 26408590: 5546 accounts (1732 with code, 11 absent, 0 item errors), 1251 code hashes, 2720 slots (2295 non-zero); keys checked 8266; unknown pin -> UnknownBlock: true; proofs at head 26408594: 175 accounts, 120 slots, 1549 account-proof nodes and 498 storage-proof nodes found in op 4, root ok: true; mismatches 0
+```
 
 ## Findings
 
@@ -194,9 +254,10 @@ done at block 26386303: 5661 accounts (1470 with code, 13 absent, 0 item errors)
 - **Harness vs in-node.** In the ExEx, tip reads go through reth's
   in-memory overlay on top of the hashed state; the harness reads the
   datadir at its state frontier, and anything behind the persisted tip
-  goes through reth's history path (see `--pin fixed`). The in-node
-  server time should be at or below the harness numbers; it can only be
-  measured once the node runs silt.
+  goes through reth's history path (see `--pin fixed`). Measured in the
+  node (above): warm server time is about twice the harness's, because the
+  node's own work shares the cores, while first touch of recent keys is
+  cheaper, because the node already holds that state.
 
 ## Reproduce
 
@@ -208,4 +269,12 @@ cargo build --release -p silt-cache --example lookup-bench --example lookup-veri
 ./target/release/examples/lookup-bench --server-pid $(pgrep -x lookup-ro) --old-offset 8000
 ./target/release/examples/lookup-verify
 kill -TERM $(pgrep -x lookup-ro)                  # removes its scratch dir
+```
+
+In the node (no harness; the node's lookup listener):
+
+```sh
+./target/release/examples/lookup-bench --lookup 127.0.0.1:8586 \
+    --server-pid $(cat /home/work/Temp/reth-node/reth.pid) --old-offset 15000
+./target/release/examples/lookup-verify --lookup 127.0.0.1:8586
 ```

@@ -137,11 +137,13 @@ ChainSpec>`); the lookup server only needs the node's provider.
   pinned RPC with zero mismatches (transfers + a storage-writing deploy).
 - M4 (lookup fast path) implemented and verified against the live mainnet
   datadir through the read-only harness: 0 mismatches vs pinned `eth_*`;
-  latency report in `docs/lookup-bench.md`. In-node measurement waits for
-  the node to run silt (silt-exex, or a node that installs silt-node).
+  latency report in `docs/lookup-bench.md`. Measured again inside the
+  running node once it installed silt-node: warm single lookups p50
+  118 µs, recent-key first touch p50 149 µs, 0 mismatches.
 - M5 (proofs as op 4, D10) implemented and verified the same way: every
   answer byte-identical to reth's multiproof, every `eth_getProof` node
-  present (`docs/proof-bench.md`).
+  present (`docs/proof-bench.md`). In the node, all 440 op-4 answers equal
+  `silt_multiproof` at the same block (`node-proof-bench`).
 - Pending (PLAN M2/M3 gates): yevm `Executor::run` replay smoke, wrapper
   kill/catch-up test under load, and the 24 h live-node equivalence soak.
 

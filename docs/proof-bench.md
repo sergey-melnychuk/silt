@@ -72,9 +72,10 @@ for one block and roughly 25 ms per further block. A 64-account proof
 costs 6 ms at the frontier and 0.79 s 32 blocks back. The server default
 `proof_max_depth` is therefore **8**, about a quarter second
 (interpolated between the measured 4 and 16), instead of the 32 first
-written into D10. This is the read-only, persisted-state path; a node
-serving pins inside its in-memory canonical blocks may be cheaper (not
-measured yet). Either way, clients should prove at the head.
+written into D10. This is the read-only, persisted-state path; inside the
+node, pins in its in-memory canonical blocks are cheaper at one or two
+blocks of depth and reach about 0.3 s at 8 (see "In the node" below).
+Either way, clients should prove at the head.
 
 ### Verification against the node (`lookup-verify`)
 
@@ -94,6 +95,68 @@ done at block 26404805: 1884 accounts (568 with code, 12 absent, 0 item errors),
 The second run spreads the slot sample across contracts (at most 2
 each). The first took its slots from the head of a sorted list, which
 landed on only a few contracts.
+
+## In the node (2026-11-13)
+
+The node now runs silt-node (yevm-node `b73b0f6`, reth `46731e9`, 4 proof
+workers), so op 4 and `silt_multiproof` can be measured where clients use
+them. `crates/silt-cache/examples/node-proof-bench.rs` is a reth-free
+client; it opens nothing next to the node. It takes its target sets from
+the node's own feed: the newest 20 single-block diffs (26408698–26408717),
+each giving every account and slot that block changed (`block`), plus
+disjoint slices of their keys for `acct-1`, `slot-1` (an account and one
+of its changed slots) and `acct-64`. Every request is proved at the head,
+in this order:
+
+1. op 4 at `LATEST`: first touch;
+2. `silt_multiproof` over HTTP, pinned to the block op 4 answered at:
+   request encode, round trip, and a typed parse (hex to path → bytes
+   maps);
+3. op 4 again at that block: warm, then a zero-copy pass over every node.
+
+Checks (any failure exits 1): keccak(op-4 root node) equals that block's
+`stateRoot`, and both op-4 answers and the JSON-RPC answer have the same
+account nodes, storage roots and storage nodes. **0 of 440 answers
+differ; 0 root failures.** Times are in µs.
+
+| workload | reqs | keys/req | nodes/req | op 4 KiB | JSON KiB | op 4 first touch p50/p90/max (server p50) | op 4 warm p50/p90/max (server / transport / decode p50) | JSON-RPC p50/p90/max (enc / rtt / parse p50) | saved vs JSON-RPC p50 |
+|---|---:|---:|---:|---:|---:|---|---|---|---|
+| block | 20 | 1387 | 7449 | 2556.8 | 5107.0 | 947404 / 1709098 / 16040528 (946283) | 57202 / 74911 / 140810 (56158 / 1042 / 154) | 89246 / 115427 / 1577431 (2636 / 72059 / 13777) | 32045 (36%) |
+| acct-1 | 200 | 1 | 10 | 4.0 | 8.0 | 388 / 670 / 2190 (287) | 363 / 642 / 1604 (275 / 85 / 0) | 550 / 900 / 3527 (8 / 489 / 53) | 187 (34%) |
+| slot-1 | 200 | 2 | 14 | 5.9 | 11.8 | 370 / 572 / 2118 (289) | 395 / 704 / 1575 (310 / 84 / 0) | 551 / 1115 / 2487 (7 / 478 / 69) | 156 (28%) |
+| acct-64 | 20 | 64 | 513 | 192.2 | 384.6 | 4711 / 5015 / 6557 (4471) | 4496 / 5108 / 5505 (4196 / 347 / 6) | 6639 / 7548 / 9100 (74 / 5430 / 989) | 2142 (32%) |
+
+Pin depth, measured in the node (op 4, server time): the first 8
+block-sized and 8 64-account requests, pinned `d` blocks below the head.
+
+| depth | block-sized: first / p50 / max server µs | 64-account: first / p50 / max server µs |
+|---:|---|---|
+| 0 | 73460 / 57129 / 76970 | 4502 / 4639 / 5425 |
+| 1 | 733725 / 93958 / 733725 | 53264 / 56975 / 59429 |
+| 2 | 136811 / 119373 / 138056 | 79492 / 80776 / 81656 |
+| 4 | 204764 / 189988 / 204764 | 145343 / 259488 / 676766 |
+| 8 | 339360 / 295217 / 339360 | 237631 / 238280 / 242053 |
+
+- **Warm proofs cost what the harness measured.** A block-sized proof
+  takes 57 ms warm (server 56 ms), the same as the harness's walk; op 4
+  adds about 1 ms of transport and 0.15 ms of decode.
+- **Small proofs cost about twice as much server time.** One account:
+  275 µs in the node against 133 µs through the harness. As with lookups
+  (`docs/lookup-bench.md`), the server shares the cores with block import,
+  and a tip read resolves reth's in-memory blocks first.
+- **First touch of a block-sized set is slow and has a long tail.** p50
+  0.95 s (harness: 0.76 s), and one of 20 took 16 s: proving a just-changed
+  set walks storage tries the node has not read since, while it imports
+  and persists blocks. That exceeds the client's default `proof_timeout`
+  (5 s); the bench raises it to 30 s. Request block-sized proofs warm, or
+  in smaller pieces, or raise the timeout.
+- **Op 4 saves 28–36% over JSON-RPC at p50** in the node (11–24% through
+  the harness): the typed parse of a block-sized JSON answer alone takes
+  14 ms, against 0.15 ms to walk the op-4 frame.
+- **Shallow pins are cheaper in the node.** One block below the head: 94 ms
+  block-sized and 57 ms for 64 accounts, against 164 ms and 104 ms through
+  the harness; each further block adds roughly 25–30 ms, about 0.3 s at
+  depth 8. The default `proof_max_depth` of 8 stands.
 
 ## Before op 4 (2026-11-12): JSON-RPC vs the walk
 
@@ -196,6 +259,14 @@ guard.sh lookupro ./target/release/examples/lookup-ro \
     --datadir /home/work/Temp/reth-node/datadir --bind 127.0.0.1:8587 &
 ./target/release/examples/lookup-verify --accounts 2000      # includes --proofs 120
 kill -TERM $(pgrep -x lookup-ro)                              # removes its scratch dir
+```
+
+In the node, nothing opens the datadir; the client needs only the node's
+feed, lookup listener and RPC:
+
+```sh
+CARGO_BUILD_JOBS=4 cargo build --release -p silt-cache --example node-proof-bench
+./target/release/examples/node-proof-bench --blocks 20 --small 200 --depths 0,1,2,4,8
 ```
 
 proof-bench binds 127.0.0.1:8588 (JSON-RPC) and 8589 (lookup), and exits
