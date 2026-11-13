@@ -15,8 +15,10 @@
 //! A reader task stamps each frame on arrival (so slow RPC checks don't
 //! skew latency) and reconnects on EOF, error or 30 s of silence,
 //! resubscribing after the last block it received. The checker also
-//! verifies continuity (parent hash, `span_start`): a jump, a `GapTooOld`
-//! or a `Reorg` drops the store to cold and is counted.
+//! classifies continuity like the cache's client
+//! ([`silt_cache::client::continuity`]): a span overlapping the tip after a
+//! node restart is applied, a re-delivered diff is skipped, and a jump, a
+//! fork, a `GapTooOld` or a `Reorg` drops the store to cold; all counted.
 //!
 //! RPC calls are retried (3 attempts over ~3 s); a key whose call still
 //! fails — the node restarting, or the block pruned or reorged away —
@@ -36,6 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
+use silt_cache::client::{Continuity, continuity};
 use silt_cache::fallback::{Fallback, HttpFallback, hex_addr, hex_word};
 use silt_cache::store::Store;
 use silt_wire::{Addr, BlockDiff, Frame, KECCAK_EMPTY, MAX_FRAME_BYTES, Word, write_frame};
@@ -343,6 +346,8 @@ struct Window {
     gaps: u64,
     reorgs: u64,
     breaks: u64,
+    overlaps: u64,
+    stale: u64,
     bytes_total: u64,
     latency_ms: Vec<f64>,
     bytes_per_block: Vec<f64>,
@@ -379,6 +384,8 @@ impl Window {
         self.gaps += o.gaps;
         self.reorgs += o.reorgs;
         self.breaks += o.breaks;
+        self.overlaps += o.overlaps;
+        self.stale += o.stale;
         self.bytes_total += o.bytes_total;
         self.latency_ms.extend(&o.latency_ms);
         self.bytes_per_block.extend(&o.bytes_per_block);
@@ -391,7 +398,7 @@ impl Window {
         let hours = elapsed.as_secs_f64() / 3600.0;
         format!(
             "SUMMARY {label} (+{hours:.2} h): blocks {} in {} diffs, keys {}, mismatches {}, unverifiable {}, \
-             reconnects {}, gaps {}, reorgs {}, breaks {} | latency ms p50/p99/max {} | bytes/block p50/p99/max {} \
+             reconnects {}, gaps {}, reorgs {}, breaks {}, overlaps {}, stale {} | latency ms p50/p99/max {} | bytes/block p50/p99/max {} \
              ({:.1} MiB) | apply µs p50/p99/max {} | check ms p50/p99/max {} | store {} accounts {} slots | rss {:.0} MiB",
             self.blocks,
             self.diffs,
@@ -402,6 +409,8 @@ impl Window {
             self.gaps,
             self.reorgs,
             self.breaks,
+            self.overlaps,
+            self.stale,
             p3(&self.latency_ms),
             p3(&self.bytes_per_block),
             self.bytes_total as f64 / (1 << 20) as f64,
@@ -482,15 +491,29 @@ async fn main() -> eyre::Result<()> {
                 received_ms,
                 replayed,
             }) => {
-                if let Some((tip, tip_hash)) = store.tip()
-                    && (diff.parent_hash != tip_hash || diff.span_start != tip + 1)
-                {
-                    window.breaks += 1;
-                    store.clear();
-                    println!(
-                        "BREAK: diff {}..{} does not extend {tip}; store dropped to cold",
-                        diff.span_start, diff.number
-                    );
+                match continuity(&store, &diff) {
+                    Continuity::Extends => {}
+                    Continuity::Overlaps => {
+                        window.overlaps += 1;
+                        println!(
+                            "OVERLAP: span {}..{} passes through our tip (node restart); applied",
+                            diff.span_start, diff.number
+                        );
+                    }
+                    Continuity::Stale => {
+                        window.stale += 1;
+                        println!("STALE: diff {} already applied; skipped", diff.number);
+                        continue;
+                    }
+                    Continuity::Break => {
+                        window.breaks += 1;
+                        let tip = store.tip().map_or(0, |(n, _)| n);
+                        store.clear();
+                        println!(
+                            "BREAK: diff {}..{} does not extend {tip}; store dropped to cold",
+                            diff.span_start, diff.number
+                        );
+                    }
                 }
                 let t = Instant::now();
                 store.apply(&diff);
@@ -597,6 +620,10 @@ async fn main() -> eyre::Result<()> {
     println!(
         "| reconnects / gaps / reorgs / breaks | {} / {} / {} / {} |",
         total.reconnects, total.gaps, total.reorgs, total.breaks
+    );
+    println!(
+        "| re-deliveries after a node restart: overlapping spans / stale diffs | {} / {} |",
+        total.overlaps, total.stale
     );
     println!(
         "| block timestamp → diff received, ms p50/p99/max | {} |",

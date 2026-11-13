@@ -143,8 +143,15 @@ impl Store {
             self.slots_by_acc.entry(*addr).or_default().insert(*slot);
         }
         {
+            // A span overlapping the tip (client::Continuity::Overlaps)
+            // repeats heads the ring already holds.
+            let tip = self.tip();
             let mut heads = self.heads.lock().expect("heads lock");
-            for head in &diff.heads {
+            for head in diff
+                .heads
+                .iter()
+                .filter(|h| tip.is_none_or(|(t, _)| h.number > t))
+            {
                 heads.push_back(head.clone());
                 while heads.len() > self.heads_cap {
                     heads.pop_front();

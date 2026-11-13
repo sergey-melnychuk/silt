@@ -28,8 +28,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// purpose: a large folded diff over a slow link must still fit.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A spooled diff frame: (tip number, encoded frame).
-type Spooled = (u64, Arc<Vec<u8>>);
+/// A spooled diff frame: (first block of its span, tip number, encoded
+/// frame). After a node restart, reth's replay can fold blocks a subscriber
+/// already holds into one span, so availability is judged by the span's
+/// start while replay order and dedupe go by its tip.
+type Spooled = (u64, u64, Arc<Vec<u8>>);
 
 #[derive(Clone)]
 enum Out {
@@ -82,7 +85,7 @@ impl Publisher {
         let bytes = Arc::new(Frame::Diff(diff.clone()).encode()?);
         {
             let mut spool = self.spool.write().await;
-            spool.push_back((number, bytes.clone()));
+            spool.push_back((diff.span_start, number, bytes.clone()));
             while spool.len() > self.spool_cap {
                 spool.pop_front();
             }
@@ -148,12 +151,19 @@ impl Publisher {
         // stops acking FinishedHeight (D5).
         let (gap, replay): (Option<u64>, Vec<Spooled>) = {
             let spool = self.spool.read().await;
+            // `from` is servable while some spooled span covers it: a span
+            // that started below `from` is replayed whole (the client
+            // applies it as an overlap of its tip).
             match (from, spool.front()) {
                 (None, _) => (None, Vec::new()),
-                (Some(from), Some(&(oldest, _))) if from < oldest => (Some(oldest), Vec::new()),
+                (Some(from), Some(&(oldest, _, _))) if from < oldest => (Some(oldest), Vec::new()),
                 (Some(from), _) => (
                     None,
-                    spool.iter().filter(|(n, _)| *n >= from).cloned().collect(),
+                    spool
+                        .iter()
+                        .filter(|(_, n, _)| *n >= from)
+                        .cloned()
+                        .collect(),
                 ),
             }
         };
@@ -164,7 +174,7 @@ impl Publisher {
             stream_write(&mut stream, &frame, self.write_timeout).await?;
         }
         let mut last_sent = 0u64;
-        for (number, bytes) in replay {
+        for (_, number, bytes) in replay {
             stream_write(&mut stream, &bytes, self.write_timeout).await?;
             last_sent = number;
         }
@@ -320,6 +330,32 @@ mod tests {
         assert_eq!(next(&mut c).await, Frame::Diff(diff(3)));
         p.publish_diff(&diff(4)).await.unwrap();
         assert_eq!(next(&mut c).await, Frame::Diff(diff(4)));
+    }
+
+    /// After a node restart the spool can begin with a folded span that
+    /// started below the subscriber's `from`: it covers `from`, so it is
+    /// replayed, not answered with `GapTooOld`.
+    #[tokio::test]
+    async fn a_span_covering_from_is_replayed_not_a_gap() {
+        let p = Publisher::new(CHAIN_ID, GENESIS, 4);
+        let mut folded = diff(50);
+        folded.span_start = 31;
+        p.publish_diff(&folded).await.unwrap();
+        p.publish_diff(&diff(51)).await.unwrap();
+        let (mut c, _server) = connect(&p, 1 << 16);
+        subscribe(&mut c, Some(41)).await;
+        assert_eq!(next(&mut c).await, Frame::Diff(folded));
+        assert_eq!(next(&mut c).await, Frame::Diff(diff(51)));
+
+        let (mut c, _server) = connect(&p, 1 << 16);
+        subscribe(&mut c, Some(30)).await;
+        assert_eq!(
+            next(&mut c).await,
+            Frame::GapTooOld {
+                oldest_available: 31
+            },
+            "a block before the span's start is gone"
+        );
     }
 
     #[tokio::test]

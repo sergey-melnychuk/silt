@@ -154,6 +154,15 @@ ChainSpec>`); the lookup server only needs the node's provider.
   latency, frame bytes, apply time and RSS (`scripts/soak.sh`). A 10-block
   smoke run: 12,510 keys, 0 mismatches, diff received p50 2.8 s after the
   block's timestamp, ~280 KB per block.
+- M3 restart recovery (G3.2), offline: `crates/silt-cache/tests/restart.rs`
+  kills and restarts a feed server under a consuming, concurrently read
+  `Cache`. A node restart that re-publishes held blocks, or a folded span
+  through the consumer's tip, resumes with no break and every head once;
+  a spool that no longer covers the consumer, or an empty spool that skips
+  ahead, drops it to cold. Two fixes came out of it: the publisher judged
+  `GapTooOld` by a span's end rather than its start, and the client now
+  applies an overlapping span (`client::continuity`) instead of dropping
+  to cold.
 - Pending (PLAN M2/M3 gates): yevm `Executor::run` replay smoke, wrapper
   kill/catch-up test under load, and the 24 h live-node equivalence soak.
 
