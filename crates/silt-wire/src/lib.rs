@@ -13,7 +13,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub mod lookup;
 
 pub const MAGIC: [u8; 4] = *b"SILT";
-pub const VERSION: u16 = 0;
+/// Covers the feed and the lookup protocol (PLAN D9): `0` at D9, `1` since
+/// D10 added op `Proof` and status `TooLarge`.
+pub const VERSION: u16 = 1;
 /// Upper bound on a single frame; a mainnet block diff is ~100-400 KB, so
 /// this is generous headroom while still rejecting garbage lengths.
 pub const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
@@ -400,13 +402,16 @@ mod tests {
         assert!(hello_mismatch(&ours, &hello(2, [7; 32], 10)).is_some());
         assert!(hello_mismatch(&ours, &hello(1, [8; 32], 10)).is_some());
         assert!(hello_mismatch(&ours, &Frame::Subscribe { from: None }).is_some());
-        let bad_version = Frame::Hello {
-            magic: MAGIC,
-            version: 1,
-            chain_id: 1,
-            genesis_hash: [7; 32],
-            tip: 10,
-        };
-        assert!(hello_mismatch(&ours, &bad_version).is_some());
+        // Any other version is refused, including v0 (D9) since D10.
+        for version in [VERSION + 1, 0] {
+            let bad_version = Frame::Hello {
+                magic: MAGIC,
+                version,
+                chain_id: 1,
+                genesis_hash: [7; 32],
+                tip: 10,
+            };
+            assert!(hello_mismatch(&ours, &bad_version).is_some(), "v{version}");
+        }
     }
 }

@@ -233,3 +233,49 @@ by a new `get_prune_checkpoints_for_availability` at `:725` (`latest()`
   reads per key (`provider.rs:484-505`) — so the harness's fixed-pin reads
   cost more than the node's tip reads, which take the in-memory overlay +
   hashed-state path.
+
+## Proof op facts (T5 VERIFY, D10)
+
+Verified at `46731e9` for op `Proof = 4` (`silt-node/src/lookup.rs`:
+`RethView::proof`, `write_multiproof`) and `examples/proof-bench.rs`.
+
+- **The read**: `StateProofProvider::multiproof(&self, TrieInput,
+  MultiProofTargets) -> ProviderResult<MultiProof>`
+  (`crates/storage/storage-api/src/trie.rs:159`), the same call as
+  `silt_multiproof` (D8). `MultiProof { account_subtree: ProofNodes,
+  branch_node_masks, storages: B256Map<StorageMultiProof> }`
+  (`crates/trie/common/src/proofs.rs:184`); `StorageMultiProof { root,
+  subtree, branch_node_masks }` (`:689`). Op 4 carries `account_subtree`
+  and each storage trie's `root` + `subtree`; the masks are dropped, as in
+  D8. `multiproof_v2` (`trie.rs:174`) is left for later.
+- **On the overlay provider** (`crates/storage/storage-overlay/src/provider.rs:752`)
+  it builds the revert overlay (`build_overlay`, `:352`), then runs one
+  sequential `DbProof::overlay_multiproof` on the view's own read
+  transaction. It uses no rayon pool, so the harness's one-thread
+  runtime doesn't slow it, and one frame stays one MDBX read transaction.
+- **Order**: `ProofNodes` and `storages` are hash maps, so the server
+  sorts them. `Nibbles: Ord` (nybbles 0.4.9 `src/nibbles.rs:193`)
+  compares the left-aligned value, then the length: lexicographic nibble
+  order, with a prefix before its extensions. `Nibbles::pack()` (`:539`)
+  packs high nibble first and leaves an odd path's last low nibble 0,
+  into a `SmallVec<[u8; 32]>` (no allocation). That is exactly the op-4
+  path encoding.
+- **Pin depth**: a pin below the persisted tip pays the revert overlay.
+  Measured: +0.1 s one block back, about 25 ms per further block, 0.8 s
+  at 32 (`docs/proof-bench.md`). Hence `proof_max_depth` = 8.
+- **MDBX reader limit**: a read transaction older than
+  `DEFAULT_MAX_READ_TRANSACTION_DURATION` (5 min,
+  `crates/storage/libmdbx-rs/src/environment.rs:27`) is aborted, and the
+  next read fails with "read transaction has been timed out (-96000)".
+  `ReadOnlyConfig::disable_long_read_transaction_safety`
+  (`crates/storage/provider/src/providers/database/builder.rs:172`)
+  lifts that, but must never be used against a live node: a long reader
+  stops MDBX reusing freed pages.
+- **`eth_getProof`** on a default node answers only the latest block:
+  `--rpc.eth-proof-window` defaults to `DEFAULT_ETH_PROOF_WINDOW = 0`
+  (`crates/rpc/rpc-server-types/src/constants.rs:62`). So the verify
+  waits for the lookup server to reach the node's head.
+- **Changesets keep plain keys** in both storage layouts (v1 MDBX and v2
+  static files; reth's own tests assert it at
+  `crates/storage/provider/src/providers/database/provider.rs:5826,6022`).
+  proof-bench keccaks them into targets.

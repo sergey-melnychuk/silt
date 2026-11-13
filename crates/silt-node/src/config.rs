@@ -18,6 +18,12 @@ pub struct SiltConfig {
     pub lookup_bind: String,
     /// Dedicated OS threads serving lookup reads (D9); never tokio workers.
     pub lookup_workers: usize,
+    /// Separate OS threads for proofs on the same listener (D10), so proof
+    /// walks never queue ahead of point reads.
+    pub lookup_proof_workers: usize,
+    /// Pinned proofs deeper than this below the head answer `UnknownBlock`
+    /// (reth's revert overlay grows with the distance, D10).
+    pub lookup_proof_max_depth: u64,
 }
 
 impl Default for SiltConfig {
@@ -28,6 +34,8 @@ impl Default for SiltConfig {
             heartbeat_secs: 10,
             lookup_bind: "127.0.0.1:8586".into(),
             lookup_workers: 16,
+            lookup_proof_workers: 4,
+            lookup_proof_max_depth: 8,
         }
     }
 }
@@ -54,6 +62,10 @@ mod tests {
         assert_eq!(cfg.bind, "127.0.0.1:8585");
         assert_eq!(cfg.lookup_bind, "127.0.0.1:8586");
         assert_eq!(cfg.lookup_workers, 16);
+        assert_eq!(
+            (cfg.lookup_proof_workers, cfg.lookup_proof_max_depth),
+            (4, 8)
+        );
     }
 
     #[test]

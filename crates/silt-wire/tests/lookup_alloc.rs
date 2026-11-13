@@ -1,13 +1,13 @@
-//! D9: decoding lookup frames never allocates. A counting global allocator
-//! (this test binary only) watches decode + full iteration of a request
-//! and a response.
+//! D9/D10: decoding lookup frames never allocates. A counting global
+//! allocator (this test binary only) watches decode + full iteration of
+//! requests and responses, proofs included.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use silt_wire::lookup::{
-    FLAG_INLINE_CODE, Item, ItemStatus, LATEST, Op, RequestBuilder, RequestRef, ResponseBuilder,
-    ResponseRef, ResultRef,
+    FLAG_INLINE_CODE, Item, ItemStatus, LATEST, Op, ProofBuilder, RequestBuilder, RequestRef,
+    ResponseBuilder, ResponseRef, ResultRef, pack_path,
 };
 
 struct Counting;
@@ -75,4 +75,51 @@ fn request_and_response_decoding_do_not_allocate() {
     });
     assert_eq!(allocs, 0, "response decode allocated");
     assert_eq!(nonces, (0..64).sum::<u64>() + 128);
+}
+
+#[test]
+fn proof_request_and_response_decoding_do_not_allocate() {
+    let mut req = RequestBuilder::new(Op::Proof, 0, 42, &LATEST);
+    for i in 0..64u8 {
+        req.push_proof_target(&[i; 32], &vec![[i; 32]; i as usize % 5]);
+    }
+    let frame = req.finish();
+    let (slots, allocs) = allocs_during(|| {
+        let req = RequestRef::decode(&frame[4..]).unwrap();
+        req.items()
+            .map(|item| match item {
+                Item::Proof(t) => t.slots().map(|s| s[0] as usize).sum::<usize>() + 1,
+                _ => unreachable!(),
+            })
+            .sum::<usize>()
+    });
+    assert_eq!(allocs, 0, "proof request decode allocated");
+    assert!(slots > 64);
+
+    let mut p = ProofBuilder::new(0, 42, 1, &[1; 32], 0);
+    let paths: Vec<Vec<u8>> = (0..65u8).map(|n| vec![n % 16; n as usize]).collect();
+    for path in &paths {
+        p.push_account_node(path.len(), &pack_path(path), &[0xC0, path.len() as u8]);
+    }
+    for i in 0..8u8 {
+        p.begin_storage(&[i; 32], &[i; 32]);
+        for path in &paths[..9] {
+            p.push_storage_node(path.len(), &pack_path(path), &[0x80 + i]);
+        }
+    }
+    let frame = p.finish(10);
+    let (total, allocs) = allocs_during(|| {
+        let resp = ResponseRef::decode(&frame[4..]).unwrap();
+        let proof = resp.proof().unwrap();
+        let nibbles =
+            |n: silt_wire::lookup::NodeRef<'_>| n.nibbles().map(usize::from).sum::<usize>();
+        let account: usize = proof.account_nodes().map(nibbles).sum();
+        let storage: usize = proof
+            .storages()
+            .map(|s| s.nodes.map(|n| n.rlp.len() + nibbles(n)).sum::<usize>())
+            .sum();
+        account + storage
+    });
+    assert_eq!(allocs, 0, "proof response decode allocated");
+    assert!(total > 0);
 }

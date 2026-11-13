@@ -104,7 +104,7 @@ pub fn parse_u64(value: &serde_json::Value) -> eyre::Result<u64> {
     Ok(u64::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16)?)
 }
 
-fn parse_bytes(value: &serde_json::Value) -> eyre::Result<Vec<u8>> {
+pub fn parse_bytes(value: &serde_json::Value) -> eyre::Result<Vec<u8>> {
     let s = value
         .as_str()
         .ok_or_else(|| eyre::eyre!("expected hex string"))?;

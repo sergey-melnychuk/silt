@@ -1,5 +1,6 @@
-//! Lookup fast path server (PLAN D9): binary request/response tip-state
-//! reads on their own listener, next to the push-only feed (D8).
+//! Lookup fast path server (PLAN D9, D10): binary request/response
+//! tip-state reads and trie proofs on their own listener, next to the
+//! push-only feed (D8).
 //!
 //! The server is generic over a small [`StateSource`], so the same code is
 //! driven by the node's provider ([`NodeSource`], from the ExEx), by the
@@ -12,7 +13,9 @@
 //! threads — never on async workers, the ExEx notification loop, or tokio's
 //! blocking pool (which reth's RPC shares). A job opens one state view per
 //! request frame, reads every item, encodes the response and drops the
-//! view: no provider/MDBX read transaction outlives a request.
+//! view: no provider/MDBX read transaction outlives a request. Proofs
+//! (op 4, D10) run the same way on a second, smaller pool, so a proof walk
+//! (ms to s) never queues ahead of point reads (µs).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
@@ -21,9 +24,10 @@ use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256, Bytes};
 use reth_ethereum::provider::{ProviderError, StateProviderBox, StateProviderFactory};
+use reth_ethereum::trie::{MultiProof, MultiProofTargets};
 use silt_wire::lookup::{
-    self, FrameWriter, Item, ItemStatus, MAX_INFLIGHT, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
-    RequestRef, ResponseBuilder, Status,
+    self, FrameWriter, Item, ItemStatus, MAX_INFLIGHT, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Op,
+    ProofBuilder, ProofTarget, RequestRef, ResponseBuilder, Status,
 };
 use silt_wire::{Addr, Frame, KECCAK_EMPTY, Word, hello, hello_mismatch, read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
@@ -67,6 +71,18 @@ pub trait StateView {
     fn storage(&self, addr: &Addr, slot: &Word) -> Result<Word, ReadError>;
     /// `None` = no bytecode under that hash.
     fn code(&self, code_hash: &Word) -> Result<Option<Bytes>, ReadError>;
+    /// Multiproof for pre-hashed targets (D10), written into `out`: account
+    /// trie nodes sorted by path, then storage tries sorted by hashed
+    /// address, each sorted by path ([`write_multiproof`] does this for
+    /// reth's `MultiProof`). Sources without proofs answer `Internal`.
+    fn proof<'a>(
+        &self,
+        targets: impl Iterator<Item = ProofTarget<'a>>,
+        out: &mut ProofBuilder,
+    ) -> Result<(), ReadError> {
+        let _ = (targets, out);
+        Err(ReadError::Other("this source serves no proofs".into()))
+    }
 }
 
 /// A view plus the block it reads at.
@@ -81,6 +97,8 @@ pub trait StateSource: Send + Sync + 'static {
     type View: StateView;
     /// `pin = None` means this source's "latest".
     fn open(&self, pin: Option<&Word>) -> Result<Opened<Self::View>, ReadError>;
+    /// The block number "latest" reads at now (the proof depth bound, D10).
+    fn head(&self) -> Result<u64, ReadError>;
 }
 
 /// Maps reth's errors: everything that means "this block's state is not
@@ -130,6 +148,49 @@ impl StateView for RethView {
             .bytecode_by_hash(&B256::from(*code_hash))
             .map_err(classify)?;
         Ok(code.map(|c| c.original_bytes()))
+    }
+
+    /// reth's v1 `multiproof` (the same read as `silt_multiproof`, D8): a
+    /// sequential walk on this view's read transaction.
+    fn proof<'a>(
+        &self,
+        targets: impl Iterator<Item = ProofTarget<'a>>,
+        out: &mut ProofBuilder,
+    ) -> Result<(), ReadError> {
+        let mut wanted = MultiProofTargets::default();
+        for t in targets {
+            wanted
+                .entry(B256::from(*t.hashed_address))
+                .or_default()
+                .extend(t.slots().map(|s| B256::from(*s)));
+        }
+        let mp = self
+            .0
+            .multiproof(Default::default(), wanted)
+            .map_err(classify)?;
+        write_multiproof(&mp, out);
+        Ok(())
+    }
+}
+
+/// Writes a reth `MultiProof` into an op-4 answer in the D10 order:
+/// account nodes by path, storage tries by hashed address, their nodes by
+/// path (reth keeps both in hash maps).
+pub fn write_multiproof(mp: &MultiProof, out: &mut ProofBuilder) {
+    let mut nodes: Vec<_> = mp.account_subtree.iter().collect();
+    nodes.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    for (path, rlp) in nodes {
+        out.push_account_node(path.len(), &path.pack(), rlp);
+    }
+    let mut storages: Vec<_> = mp.storages.iter().collect();
+    storages.sort_unstable_by_key(|(hashed_address, _)| **hashed_address);
+    for (hashed_address, sp) in storages {
+        out.begin_storage(&hashed_address.0, &sp.root.0);
+        let mut nodes: Vec<_> = sp.subtree.iter().collect();
+        nodes.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (path, rlp) in nodes {
+            out.push_storage_node(path.len(), &path.pack(), rlp);
+        }
     }
 }
 
@@ -190,6 +251,10 @@ where
             view: RethView(state),
         })
     }
+
+    fn head(&self) -> Result<u64, ReadError> {
+        Ok(self.provider.chain_info().map_err(classify)?.best_number)
+    }
 }
 
 // --------------------------------------------------------------- the server
@@ -208,6 +273,15 @@ pub struct LookupConfig {
     /// Silence between frames before the connection is dropped (clients
     /// ping every 30 s).
     pub idle_timeout: Duration,
+    /// Dedicated proof threads (D10), apart from `workers`.
+    pub proof_workers: usize,
+    /// Server-wide queued proof jobs; `Busy` beyond.
+    pub proof_queue: usize,
+    /// Pinned proofs more than this many blocks below the source's head
+    /// answer `UnknownBlock`: reth's revert overlay grows with the
+    /// distance, about 25 ms per block on the persisted-state path
+    /// (D10, docs/proof-bench.md).
+    pub proof_max_depth: u64,
 }
 
 impl Default for LookupConfig {
@@ -215,6 +289,9 @@ impl Default for LookupConfig {
         Self {
             workers: 16,
             queue: 4096,
+            proof_workers: 4,
+            proof_queue: 64,
+            proof_max_depth: 8,
             handshake_timeout: Duration::from_secs(10),
             frame_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(10),
@@ -231,13 +308,13 @@ struct Pool {
 }
 
 impl Pool {
-    fn new(workers: usize, queue: usize) -> std::io::Result<Self> {
+    fn new(name: &str, workers: usize, queue: usize) -> std::io::Result<Self> {
         let (tx, rx) = sync_channel::<Job>(queue.max(1));
         let rx = Arc::new(Mutex::new(rx));
         for i in 0..workers.max(1) {
             let rx = rx.clone();
             std::thread::Builder::new()
-                .name(format!("silt-lookup-{i}"))
+                .name(format!("{name}-{i}"))
                 .spawn(move || {
                     loop {
                         // The lock is held only while waiting for one job.
@@ -266,6 +343,7 @@ impl Pool {
 pub struct LookupServer<S> {
     source: Arc<S>,
     pool: Pool,
+    proof_pool: Pool,
     chain_id: u64,
     genesis_hash: Word,
     /// Newest block any request read at (the `tip` in our Hello).
@@ -282,7 +360,8 @@ impl<S: StateSource> LookupServer<S> {
     ) -> std::io::Result<Arc<Self>> {
         Ok(Arc::new(Self {
             source: Arc::new(source),
-            pool: Pool::new(cfg.workers, cfg.queue)?,
+            pool: Pool::new("silt-lookup", cfg.workers, cfg.queue)?,
+            proof_pool: Pool::new("silt-proof", cfg.proof_workers, cfg.proof_queue)?,
             chain_id,
             genesis_hash,
             tip: Arc::new(AtomicU64::new(0)),
@@ -434,6 +513,12 @@ impl<S: StateSource> LookupServer<S> {
                 }
             };
             let (op, flags, id) = (req.op as u8, req.flags, req.id);
+            // Proofs (D10) get their own threads; read before `body` moves.
+            let pool = if req.op == Op::Proof {
+                &self.proof_pool
+            } else {
+                &self.pool
+            };
             let busy = || lookup::error_response(op, flags, id, Status::Busy, micros(started));
             let Ok(admitted) = jobs.clone().try_acquire_owned() else {
                 writer.send(busy(), output)?;
@@ -443,15 +528,16 @@ impl<S: StateSource> LookupServer<S> {
                 let source = self.source.clone();
                 let tip = self.tip.clone();
                 let writer = writer.clone();
+                let max_depth = self.cfg.proof_max_depth;
                 Box::new(move || {
-                    let frame = answer(&*source, &body, started, &tip);
+                    let frame = answer(&*source, &body, started, &tip, max_depth);
                     drop(admitted); // built: no longer in flight (see `handle`)
                     // Straight to the socket from this thread when it can
                     // take it (no task hop); fails only once closed.
                     let _ = writer.send(frame, output);
                 }) as Job
             };
-            if !self.pool.try_submit(job) {
+            if !pool.try_submit(job) {
                 // Server-wide queue full: the rejected job dropped its
                 // slots; take a fresh output slot for the Busy answer.
                 let output = outputs.clone().acquire_owned().await?;
@@ -468,13 +554,47 @@ fn micros(since: Instant) -> u32 {
     since.elapsed().as_micros().min(u32::MAX as u128) as u32
 }
 
+/// An answer being built: lookups (ops 1–3) or a proof (op 4).
+enum Built {
+    Lookup(ResponseBuilder),
+    Proof(ProofBuilder),
+}
+
+impl Built {
+    fn body_len(&self) -> usize {
+        match self {
+            Self::Lookup(b) => b.body_len(),
+            Self::Proof(b) => b.body_len(),
+        }
+    }
+
+    fn finish(self, server_us: u32) -> Vec<u8> {
+        match self {
+            Self::Lookup(b) => b.finish(server_us),
+            Self::Proof(b) => b.finish(server_us),
+        }
+    }
+}
+
 /// One request frame, start to finish, on a pool thread: open one view,
-/// read every item in order, drop the view, encode.
-fn answer<S: StateSource>(source: &S, body: &[u8], started: Instant, tip: &AtomicU64) -> Vec<u8> {
+/// read every item in order (or walk the proof), drop the view, encode.
+fn answer<S: StateSource>(
+    source: &S,
+    body: &[u8],
+    started: Instant,
+    tip: &AtomicU64,
+    proof_max_depth: u64,
+) -> Vec<u8> {
     let req = RequestRef::decode(body).expect("validated by the reader");
     let fail =
         |status| lookup::error_response(req.op as u8, req.flags, req.id, status, micros(started));
-    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_all(source, &req)));
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if req.op == Op::Proof {
+            prove(source, &req, proof_max_depth).map(|(b, n)| (Built::Proof(b), n))
+        } else {
+            read_all(source, &req).map(|(b, n)| (Built::Lookup(b), n))
+        }
+    }));
     let out = match run {
         Ok(Ok(out)) => out,
         Ok(Err(ReadError::UnknownBlock(msg))) => {
@@ -491,10 +611,41 @@ fn answer<S: StateSource>(source: &S, body: &[u8], started: Instant, tip: &Atomi
         }
     };
     if out.0.body_len() > MAX_RESPONSE_BYTES {
-        return fail(Status::Internal);
+        return fail(Status::TooLarge);
     }
     tip.fetch_max(out.1, Ordering::Relaxed);
     out.0.finish(micros(started))
+}
+
+/// One Proof frame (D10): resolve the pin, refuse pins deeper than
+/// `max_depth` below the head, walk, drop the view.
+fn prove<S: StateSource>(
+    source: &S,
+    req: &RequestRef<'_>,
+    max_depth: u64,
+) -> Result<(ProofBuilder, u64), ReadError> {
+    let pin = (!req.is_latest()).then_some(req.pin);
+    let Opened { number, hash, view } = source.open(pin)?;
+    if pin.is_some() {
+        let head = source.head()?;
+        if head.saturating_sub(number) > max_depth {
+            return Err(ReadError::UnknownBlock(format!(
+                "block {number} is {} below the head {head}; proofs serve the last {max_depth}",
+                head - number
+            )));
+        }
+    }
+    let mut out = ProofBuilder::new(req.flags, req.id, number, &hash, 0);
+    if req.count() > 0 {
+        let targets = req.items().map(|item| match item {
+            Item::Proof(t) => t,
+            _ => unreachable!("op validated as Proof"),
+        });
+        view.proof(targets, &mut out)?;
+    }
+    // The read transaction ends here, before the response is finished.
+    drop(view);
+    Ok((out, number))
 }
 
 /// Reads all items into a response; a frame-level failure (state not
@@ -554,9 +705,10 @@ fn read_all<S: StateSource>(
                 Err(ReadError::UnknownBlock(m)) => return Err(ReadError::UnknownBlock(m)),
                 Err(ReadError::Other(_)) => out.push_code(ItemStatus::Error, &[]),
             },
+            Item::Proof(_) => unreachable!("Proof frames go to prove()"),
         }
         if out.body_len() > MAX_RESPONSE_BYTES {
-            break; // answered `Internal` by the caller
+            break; // answered `TooLarge` by the caller
         }
     }
     // The read transaction ends here, before the response is finished.
@@ -568,7 +720,7 @@ fn read_all<S: StateSource>(
 mod tests {
     use super::*;
     use silt_wire::lookup::{
-        FLAG_INLINE_CODE, LATEST, Op, RequestBuilder, ResponseRef, ResultRef, read_body,
+        FLAG_INLINE_CODE, LATEST, RequestBuilder, ResponseRef, ResultRef, pack_path, read_body,
     };
     use std::collections::HashMap;
     use std::sync::Condvar;
@@ -597,6 +749,10 @@ mod tests {
     const CODE: &[u8] = &[0x60, 0x00, 0x60, 0x00, 0xf3];
     const CODE_HASH: Word = [0xC1; 32];
     const HUGE_HASH: Word = [0x4B; 32];
+    /// Proof targets with scripted behavior.
+    const PROOF_SLOW: Word = [0x51; 32];
+    const PROOF_HUGE: Word = [0x4B; 32];
+    const PROOF_FAILS: Word = [0xFA; 32];
 
     #[derive(Default)]
     struct Gate {
@@ -670,6 +826,42 @@ mod tests {
                 _ => None,
             })
         }
+        /// Root RLP `[0xF8, block]`; one account node per target at its
+        /// first two nibbles; one storage trie (root `[0x5A; 32]`) per
+        /// target with slots, one node per slot. Sorted, as the trait asks.
+        fn proof<'a>(
+            &self,
+            targets: impl Iterator<Item = ProofTarget<'a>>,
+            out: &mut ProofBuilder,
+        ) -> Result<(), ReadError> {
+            let mut targets: Vec<_> = targets.collect();
+            targets.sort_by_key(|t| *t.hashed_address);
+            let has = |w: Word| targets.iter().any(|t| *t.hashed_address == w);
+            if has(PROOF_SLOW) {
+                self.0.gate.wait();
+            }
+            if has(PROOF_FAILS) {
+                return Err(ReadError::Other("trie on fire".into()));
+            }
+            if has(PROOF_HUGE) {
+                for i in 0..17u8 {
+                    out.push_account_node(2, &pack_path(&[i >> 4, i & 15]), &vec![0xB9; 1 << 20]);
+                }
+                return Ok(());
+            }
+            out.push_account_node(0, &[], &[0xF8, self.1 as u8]);
+            for t in &targets {
+                let a = t.hashed_address[0];
+                out.push_account_node(2, &pack_path(&[a >> 4, a & 15]), &[a]);
+            }
+            for t in targets.iter().filter(|t| t.slot_count() > 0) {
+                out.begin_storage(t.hashed_address, &[0x5A; 32]);
+                for slot in t.slots() {
+                    out.push_storage_node(1, &pack_path(&[slot[0] >> 4]), &[slot[0]]);
+                }
+            }
+            Ok(())
+        }
     }
 
     impl StateSource for MemSource {
@@ -687,6 +879,9 @@ mod tests {
                 hash,
                 view: MemView(self.0.clone(), number),
             })
+        }
+        fn head(&self) -> Result<u64, ReadError> {
+            Ok(HEAD.0)
         }
     }
 
@@ -1100,8 +1295,137 @@ mod tests {
         assert_eq!(ResponseRef::decode(&r).unwrap().status, Status::Ok);
     }
 
+    fn proof_req(id: u32, pin: &Word, targets: &[(Word, Vec<Word>)]) -> Vec<u8> {
+        let mut b = RequestBuilder::new(Op::Proof, 0, id, pin);
+        for (a, slots) in targets {
+            b.push_proof_target(a, slots);
+        }
+        b.finish()
+    }
+
+    /// (status, read_number, account nodes as (nibbles, rlp), storage tries
+    /// as (hashed address, root, node count)).
+    type ProofSummary = (
+        Status,
+        u64,
+        Vec<(Vec<u8>, Vec<u8>)>,
+        Vec<(Word, Word, usize)>,
+    );
+
+    fn summarize(body: &[u8]) -> ProofSummary {
+        let r = ResponseRef::decode(body).unwrap();
+        let Some(p) = r.proof() else {
+            return (r.status, r.read_number, vec![], vec![]);
+        };
+        let nodes = p
+            .account_nodes()
+            .map(|n| (n.nibbles().collect(), n.rlp.to_vec()))
+            .collect();
+        let storages = p
+            .storages()
+            .map(|st| (*st.hashed_address, *st.storage_root, st.nodes.count()))
+            .collect();
+        (r.status, r.read_number, nodes, storages)
+    }
+
     #[tokio::test]
-    async fn oversized_response_answers_internal() {
+    async fn proofs_answer_in_order_with_pins_pings_and_depth_bound() {
+        let (s, _) = server(LookupConfig::default());
+        let (mut c, _task) = connect(&s).await;
+        let targets = vec![([0x56; 32], vec![]), ([0x12; 32], vec![[0x34; 32]])];
+        send(&mut c, proof_req(1, &LATEST, &targets)).await;
+        let (status, number, nodes, storages) = summarize(&recv(&mut c).await);
+        assert_eq!((status, number), (Status::Ok, HEAD.0));
+        assert_eq!(
+            nodes,
+            [
+                (vec![], vec![0xF8, HEAD.0 as u8]),
+                (vec![1, 2], vec![0x12]),
+                (vec![5, 6], vec![0x56]),
+            ]
+        );
+        assert_eq!(storages, [([0x12; 32], [0x5A; 32], 1)]);
+
+        // One block back is within the default depth (32).
+        send(&mut c, proof_req(2, &PARENT.1, &targets)).await;
+        let (status, number, nodes, _) = summarize(&recv(&mut c).await);
+        assert_eq!((status, number), (Status::Ok, PARENT.0));
+        assert_eq!(nodes[0].1, [0xF8, PARENT.0 as u8], "read at the pin");
+
+        // count = 0: a ping, no walk.
+        send(&mut c, proof_req(3, &LATEST, &[])).await;
+        assert_eq!(
+            summarize(&recv(&mut c).await),
+            (Status::Ok, HEAD.0, vec![], vec![])
+        );
+
+        // Unknown pins, failing walks.
+        send(&mut c, proof_req(4, &[0x33; 32], &targets)).await;
+        assert_eq!(summarize(&recv(&mut c).await).0, Status::UnknownBlock);
+        send(&mut c, proof_req(5, &BROKEN_PIN, &targets)).await;
+        assert_eq!(summarize(&recv(&mut c).await).0, Status::Internal);
+        send(&mut c, proof_req(6, &LATEST, &[(PROOF_FAILS, vec![])])).await;
+        assert_eq!(summarize(&recv(&mut c).await).0, Status::Internal);
+        send(&mut c, proof_req(7, &LATEST, &[(PROOF_HUGE, vec![])])).await;
+        assert_eq!(summarize(&recv(&mut c).await).0, Status::TooLarge);
+
+        // Depth 0: only the head itself is provable; lookups are unaffected.
+        let (s, _) = server(LookupConfig {
+            proof_max_depth: 0,
+            ..Default::default()
+        });
+        let (mut c, _task) = connect(&s).await;
+        send(&mut c, proof_req(1, &PARENT.1, &targets)).await;
+        assert_eq!(summarize(&recv(&mut c).await).0, Status::UnknownBlock);
+        send(&mut c, proof_req(2, &HEAD.1, &targets)).await;
+        assert_eq!(summarize(&recv(&mut c).await).0, Status::Ok);
+        send(&mut c, storage_req(3, &PARENT.1, &[PER_BLOCK])).await;
+        let body = recv(&mut c).await;
+        assert_eq!(ResponseRef::decode(&body).unwrap().status, Status::Ok);
+    }
+
+    #[tokio::test]
+    async fn slow_proofs_never_delay_lookups_and_their_queue_answers_busy() {
+        let (s, data) = server(LookupConfig {
+            workers: 1,
+            proof_workers: 1,
+            proof_queue: 1,
+            ..Default::default()
+        });
+        let (mut c, _task) = connect(&s).await;
+        let slow = vec![(PROOF_SLOW, vec![])];
+        send(&mut c, proof_req(1, &LATEST, &slow)).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while data.gate.entered.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < deadline, "proof never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The only proof thread is stuck: lookups still flow.
+        for id in 10..20 {
+            send(&mut c, storage_req(id, &LATEST, &[PER_BLOCK])).await;
+            let r = recv(&mut c).await;
+            let r = ResponseRef::decode(&r).unwrap();
+            assert_eq!((r.id, r.status), (id, Status::Ok));
+        }
+        // One proof fits the queue; the next is Busy at once.
+        send(&mut c, proof_req(2, &LATEST, &[([1; 32], vec![])])).await;
+        send(&mut c, proof_req(3, &LATEST, &[([1; 32], vec![])])).await;
+        let r = recv(&mut c).await;
+        let r = ResponseRef::decode(&r).unwrap();
+        assert_eq!((r.id, r.status), (3, Status::Busy));
+        data.gate.release();
+        let mut done: Vec<_> = Vec::new();
+        for _ in 0..2 {
+            let r = recv(&mut c).await;
+            let r = ResponseRef::decode(&r).unwrap();
+            done.push((r.id, r.status));
+        }
+        done.sort_by_key(|d| d.0);
+        assert_eq!(done, [(1, Status::Ok), (2, Status::Ok)]);
+    }
+
+    #[tokio::test]
+    async fn oversized_response_answers_too_large() {
         let (s, _) = server(LookupConfig::default());
         let (mut c, _task) = connect(&s).await;
         let mut b = RequestBuilder::new(Op::Code, 0, 7, &LATEST);
@@ -1110,7 +1434,7 @@ mod tests {
         }
         send(&mut c, b.finish()).await;
         let r = recv(&mut c).await;
-        assert_eq!(ResponseRef::decode(&r).unwrap().status, Status::Internal);
+        assert_eq!(ResponseRef::decode(&r).unwrap().status, Status::TooLarge);
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::error::INTERNAL_ERROR_CODE;
 use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 use reth_ethereum::provider::{StateProofProvider, StateProviderFactory};
-use reth_ethereum::trie::{MultiProofTargets, Nibbles};
+use reth_ethereum::trie::{MultiProof, MultiProofTargets, Nibbles};
 use serde::Serialize;
 
 /// Storage-trie half of a [`MultiproofResponse`] entry.
@@ -108,7 +108,15 @@ where
         .await
         .map_err(internal)??;
 
-        Ok(MultiproofResponse {
+        Ok(MultiproofResponse::from_multiproof(mp))
+    }
+}
+
+impl MultiproofResponse {
+    /// The wire shape of a reth [`MultiProof`]: what `silt_multiproof`
+    /// returns (also used by the proof bench to time the same conversion).
+    pub fn from_multiproof(mp: MultiProof) -> Self {
+        Self {
             account_subtree: subtree(mp.account_subtree.iter()),
             storages: mp
                 .storages
@@ -121,7 +129,7 @@ where
                     (hashed_address, storage)
                 })
                 .collect(),
-        })
+        }
     }
 }
 

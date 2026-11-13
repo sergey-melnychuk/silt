@@ -4,7 +4,7 @@
 //!
 //! Usage:
 //!   lookup-verify [--lookup 127.0.0.1:8587] [--rpc http://127.0.0.1:8545]
-//!                 [--accounts 6000] [--slots 3000]
+//!                 [--accounts 6000] [--slots 3000] [--proofs 120]
 //!
 //! Pins one block — the server's "latest" (the read-only harness's state
 //! frontier) at start — and checks keys from recent blocks and from ~5000
@@ -12,15 +12,24 @@
 //! against keccak(code) (`KECCAK_EMPTY` for none), `Absent` accounts against
 //! RPC zeros, `Code(code_hash)` against the inline code, and every storage
 //! slot. Also checks that an unknown hash answers `UnknownBlock`.
+//!
+//! Proofs (D10): op-4 proofs for `--proofs` accounts (with their sampled
+//! slots) at the node's **head** — reth answers `eth_getProof` only there
+//! (default proof window 0), so it waits for the lookup server to reach
+//! the head and retries when a new block lands mid-round. Every node of
+//! every `accountProof` and `storageProof` must appear in the op-4 answer,
+//! each `storageHash` must equal its op-4 storage root, and keccak(op-4
+//! root node) must equal the header's `stateRoot`.
 
 #[path = "common/keys.rs"]
 mod keys;
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use silt_cache::fallback::{hex_addr, hex_word};
+use silt_cache::fallback::{hex_addr, hex_word, parse_bytes, parse_u64, parse_word};
 use silt_cache::lookup::{LookupClient, LookupClientConfig, LookupError};
 use silt_cache::{Fallback, HttpFallback};
 use silt_wire::lookup::{ItemStatus, LATEST, Status};
@@ -31,6 +40,7 @@ struct Args {
     rpc: String,
     accounts: usize,
     slots: usize,
+    proofs: usize,
 }
 
 fn args() -> eyre::Result<Args> {
@@ -39,6 +49,7 @@ fn args() -> eyre::Result<Args> {
         rpc: "http://127.0.0.1:8545".into(),
         accounts: 6000,
         slots: 3000,
+        proofs: 120,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -48,6 +59,7 @@ fn args() -> eyre::Result<Args> {
             "--rpc" => a.rpc = v()?,
             "--accounts" => a.accounts = v()?.parse()?,
             "--slots" => a.slots = v()?.parse()?,
+            "--proofs" => a.proofs = v()?.parse()?,
             other => eyre::bail!("unknown flag {other}"),
         }
     }
@@ -233,10 +245,21 @@ async fn main() -> eyre::Result<()> {
         println!("MISMATCH unknown pin answered {unknown:?}");
     }
 
+    let proofs = if args.proofs > 0 {
+        let p = verify_proofs(&client, &rpc, &accounts, &slots, args.proofs).await?;
+        mismatches += p.mismatches;
+        format!(
+            "; proofs at head {}: {} accounts, {} slots, {} account-proof nodes and {} storage-proof nodes found in op 4, root ok: {}",
+            p.head, p.accounts, p.slots, p.account_nodes, p.storage_nodes, p.root_ok
+        )
+    } else {
+        String::new()
+    };
+
     println!(
         "done at block {number}: {} accounts ({contracts} with code, {absent} absent, {item_errors} item errors), \
          {code_checked} code hashes, {} slots ({nonzero} non-zero); keys checked {checked}; \
-         unknown pin -> UnknownBlock: {unknown_ok}; mismatches {mismatches}",
+         unknown pin -> UnknownBlock: {unknown_ok}{proofs}; mismatches {mismatches}",
         lookup_accounts.len(),
         lookup_slots.len()
     );
@@ -244,4 +267,139 @@ async fn main() -> eyre::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+struct ProofCheck {
+    head: u64,
+    accounts: usize,
+    slots: usize,
+    account_nodes: usize,
+    storage_nodes: usize,
+    root_ok: bool,
+    mismatches: u64,
+}
+
+/// See the module docs: op 4 vs `eth_getProof`, both at the node's head.
+async fn verify_proofs(
+    client: &LookupClient,
+    rpc: &keys::Rpc,
+    accounts: &[Addr],
+    slots: &[(Addr, Word)],
+    n: usize,
+) -> eyre::Result<ProofCheck> {
+    // n accounts, plus up to n slots spread over contracts (≤ 2 each; the
+    // slot list is sorted, so its head would cluster on a few contracts).
+    let mut sample: BTreeMap<Addr, Vec<Word>> = BTreeMap::new();
+    let mut taken = 0;
+    for (a, s) in slots {
+        let v = sample.entry(*a).or_default();
+        if v.len() < 2 {
+            v.push(*s);
+            taken += 1;
+            if taken == n {
+                break;
+            }
+        }
+    }
+    for a in accounts.iter().take(n) {
+        sample.entry(*a).or_default();
+    }
+    let sample: Vec<(Addr, Vec<Word>)> = sample.into_iter().collect();
+    let targets: Vec<(Word, Vec<Word>)> = sample
+        .iter()
+        .map(|(a, s)| (keys::keccak(a), s.iter().map(|s| keys::keccak(s)).collect()))
+        .collect();
+
+    for attempt in 1..=20 {
+        let head = rpc
+            .call("eth_getBlockByNumber", serde_json::json!(["latest", false]))
+            .await?;
+        let hash = parse_word(&head["hash"])?;
+        let number = parse_u64(&head["number"])?;
+        let state_root = parse_word(&head["stateRoot"])?;
+        let frame = match client.proof(&hash, &targets).await {
+            Ok(frame) => frame,
+            // The read-only server's frontier trails the node's head by a
+            // persist; wait for it.
+            Err(LookupError::Status(Status::UnknownBlock)) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(err) => eyre::bail!("op 4 at head {number}: {err}"),
+        };
+        let answers: Vec<eyre::Result<serde_json::Value>> = futures::stream::iter(&sample)
+            .map(|(a, s)| {
+                let keys: Vec<String> = s.iter().map(hex_word).collect();
+                let at = serde_json::json!({ "blockHash": hex_word(&hash) });
+                rpc.call("eth_getProof", serde_json::json!([hex_addr(a), keys, at]))
+            })
+            .buffered(16)
+            .collect()
+            .await;
+        if let Some(Err(err)) = answers.iter().find(|r| r.is_err()) {
+            // Typically a new block landed: the node proves only its head.
+            println!("proof round {attempt} at {number}: eth_getProof failed ({err}); retrying");
+            continue;
+        }
+
+        let p = frame.to_read();
+        let account_nodes: HashSet<&[u8]> =
+            p.account_nodes.iter().map(|n| n.rlp.as_slice()).collect();
+        let root_ok = p
+            .account_nodes
+            .iter()
+            .find(|n| n.path.is_empty())
+            .is_some_and(|n| keys::keccak(&n.rlp) == state_root);
+        let storages: HashMap<Word, (Word, HashSet<&[u8]>)> = p
+            .storages
+            .iter()
+            .map(|st| {
+                let nodes = st.nodes.iter().map(|n| n.rlp.as_slice()).collect();
+                (st.hashed_address, (st.storage_root, nodes))
+            })
+            .collect();
+        let mut check = ProofCheck {
+            head: number,
+            accounts: sample.len(),
+            slots: sample.iter().map(|(_, s)| s.len()).sum(),
+            account_nodes: 0,
+            storage_nodes: 0,
+            root_ok,
+            mismatches: (!root_ok) as u64,
+        };
+        for ((addr, slots), answer) in sample.iter().zip(answers) {
+            let answer = answer?;
+            let mut bad = Vec::new();
+            for node in answer["accountProof"].as_array().into_iter().flatten() {
+                check.account_nodes += 1;
+                if !account_nodes.contains(parse_bytes(node)?.as_slice()) {
+                    bad.push("account node missing");
+                }
+            }
+            if !slots.is_empty() {
+                match storages.get(&keys::keccak(addr)) {
+                    None => bad.push("no storage trie"),
+                    Some((root, nodes)) => {
+                        if parse_word(&answer["storageHash"])? != *root {
+                            bad.push("storage root");
+                        }
+                        for sp in answer["storageProof"].as_array().into_iter().flatten() {
+                            for node in sp["proof"].as_array().into_iter().flatten() {
+                                check.storage_nodes += 1;
+                                if !nodes.contains(parse_bytes(node)?.as_slice()) {
+                                    bad.push("storage node missing");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !bad.is_empty() {
+                check.mismatches += 1;
+                println!("MISMATCH proof {} {bad:?}", hex_addr(addr));
+            }
+        }
+        return Ok(check);
+    }
+    eyre::bail!("no proof round completed: the lookup server never reached the node's head")
 }

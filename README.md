@@ -12,8 +12,8 @@ is drop-to-cold (v0). See `PLAN.md` for the full design and milestones,
 
 | Crate | What | reth? |
 |---|---|---|
-| `silt-wire` | wire types, postcard codec, framing, handshake; the binary lookup layout (`lookup`) | no |
-| `silt-node` | library any reth node installs: the feed ExEx + TCP publisher, lookup server, `silt_multiproof` RPC | pinned `46731e9` (2.10.1-dev) |
+| `silt-wire` | wire types, postcard codec, framing, handshake; the binary lookup + proof layout (`lookup`) | no |
+| `silt-node` | library any reth node installs: the feed ExEx + TCP publisher, lookup + proof server, `silt_multiproof` RPC | pinned `46731e9` (2.10.1-dev) |
 | `silt-exex` | thin binary: stock reth with silt-node installed | pinned `46731e9` (2.10.1-dev) |
 | `silt-cache` | subscriber, cache, lookup client, RPC fallback, Chain-shaped API (+ optional `yevm` adapter) | no |
 
@@ -24,7 +24,8 @@ cargo build --release                       # wire + cache (reth-free)
 cargo build --release -p silt-exex          # the node wrapper (compiles reth)
 
 # the wrapper IS reth — same CLI, same datadir; silt.toml (optional, in the
-# working directory) sets bind/spool/heartbeat_secs/lookup_bind/lookup_workers;
+# working directory) sets bind/spool/heartbeat_secs/lookup_bind/lookup_workers/
+# lookup_proof_workers/lookup_proof_max_depth;
 # defaults: feed on 127.0.0.1:8585, lookup fast path on 127.0.0.1:8586
 ./target/release/silt-exex node <your usual reth flags>
 
@@ -42,7 +43,21 @@ with SSD reads p50 0.3–0.8 ms, 0 mismatches vs pinned `eth_*`):
 # silt.toml
 lookup_bind = "127.0.0.1:8586"   # never 0.0.0.0: no auth (D1)
 lookup_workers = 16              # dedicated read threads
+lookup_proof_workers = 4         # proofs (op 4) on their own threads
+lookup_proof_max_depth = 8       # deeper proof pins answer UnknownBlock
 ```
+
+Trie proofs ride the same listener as op `Proof = 4` (PLAN D10): the read
+`silt_multiproof` serves (pre-hashed, path-directed targets), without
+JSON, hex or HTTP. `LookupClient::proof(pin, targets)` returns a
+`ProofFrame` you can walk without copying (`frame.proof()`) or copy out
+(`frame.to_read()`). Every answer is byte-identical to reth's in-process
+multiproof, and every `eth_getProof` node is found in op 4
+(`docs/proof-bench.md`). Op 4 adds 36–61 µs to the trie walk for small
+proofs, 11–24% less than JSON-RPC at p50. Prove at the head: every block
+of pin depth costs reth a revert overlay, about 0.1 s at one block and
+0.8 s at 32. Protocol `VERSION` is 1 since D10, so v0 peers are refused
+at the handshake.
 
 ```sh
 # serve the same protocol from a live datadir, read-only, without touching
@@ -50,8 +65,15 @@ lookup_workers = 16              # dedicated read threads
 cargo run --release -p silt-node --example lookup-ro -- \
     --datadir /path/to/datadir --bind 127.0.0.1:8587
 cargo run --release -p silt-cache --example lookup-bench -- --server-pid $(pgrep -x lookup-ro)
-cargo run --release -p silt-cache --example lookup-verify
+cargo run --release -p silt-cache --example lookup-verify   # + op 4 vs eth_getProof at the head
+cargo run --release -p silt-node --example proof-bench -- --datadir /path/to/datadir
 ```
+
+Next to a live node, run these harnesses under a memory cap. They pull
+GBs of database pages and once pushed the machine into the memory
+pressure that got the node killed: `systemd-run --user --scope -p
+MemoryMax=6G -p MemorySwapMax=0 …`, plus a pressure watchdog
+(`docs/proof-bench.md`, Reproduce).
 
 Path-directed multiproofs (PLAN D8) — proofs for **pre-hashed** trie keys,
 the read `eth_getProof` cannot express; served on reth's own RPC
@@ -117,6 +139,9 @@ ChainSpec>`); the lookup server only needs the node's provider.
   datadir through the read-only harness: 0 mismatches vs pinned `eth_*`;
   latency report in `docs/lookup-bench.md`. In-node measurement waits for
   the node to run silt (silt-exex, or a node that installs silt-node).
+- M5 (proofs as op 4, D10) implemented and verified the same way: every
+  answer byte-identical to reth's multiproof, every `eth_getProof` node
+  present (`docs/proof-bench.md`).
 - Pending (PLAN M2/M3 gates): yevm `Executor::run` replay smoke, wrapper
   kill/catch-up test under load, and the 24 h live-node equivalence soak.
 

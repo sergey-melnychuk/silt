@@ -1,5 +1,6 @@
-//! Lookup fast-path client (PLAN D9) and [`LookupFallback`], the
-//! [`Fallback`] that sends cache misses over it.
+//! Lookup fast-path client (PLAN D9, D10) and [`LookupFallback`], the
+//! [`Fallback`] that sends cache misses over it. [`LookupClient::proof`]
+//! fetches trie proofs (op 4) on the same connection.
 //!
 //! One TCP connection carries up to [`MAX_INFLIGHT`] requests; answers are
 //! matched to callers by id, in any order. A supervisor task owns the
@@ -15,8 +16,9 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use silt_wire::lookup::{
-    self, FLAG_INLINE_CODE, FrameWriter, ItemStatus, LATEST, MAX_INFLIGHT, MAX_RESPONSE_BYTES, Op,
-    RequestBuilder, ResponseRef, ResultRef, Status,
+    self, FLAG_INLINE_CODE, FrameWriter, ItemStatus, LATEST, MAX_INFLIGHT, MAX_ITEMS,
+    MAX_PROOF_SLOTS, MAX_RESPONSE_BYTES, NodeRef, Op, ProofRef, RequestBuilder, ResponseRef,
+    ResultRef, Status,
 };
 use silt_wire::{Addr, Frame, Word, hello, hello_mismatch, read_frame, write_frame};
 use tokio::io::{AsyncRead, BufReader};
@@ -31,6 +33,9 @@ pub struct LookupClientConfig {
     pub addr: String,
     /// Per-request deadline (slot wait + round trip).
     pub timeout: Duration,
+    /// The same for [`LookupClient::proof`]: a cold block-sized proof
+    /// walk takes about a second (docs/proof-bench.md).
+    pub proof_timeout: Duration,
     pub connect_timeout: Duration,
     pub backoff_min: Duration,
     pub backoff_max: Duration,
@@ -44,6 +49,7 @@ impl LookupClientConfig {
         Self {
             addr: addr.into(),
             timeout: Duration::from_millis(500),
+            proof_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(1),
             backoff_min: Duration::from_millis(100),
             backoff_max: Duration::from_secs(5),
@@ -118,6 +124,76 @@ pub struct StorageRead {
 pub struct CodeRead {
     pub status: ItemStatus,
     pub code: Vec<u8>,
+}
+
+/// A validated Proof answer (D10), kept as the received bytes: walk it
+/// without copying through [`ProofFrame::proof`], or copy it out with
+/// [`ProofFrame::to_read`]. Nodes are untrusted until hash-verified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProofFrame {
+    pub read_number: u64,
+    pub read_hash: Word,
+    /// Server time decode → encode, as for lookups.
+    pub server_us: u32,
+    body: Vec<u8>,
+}
+
+impl ProofFrame {
+    /// Borrowed view: account nodes sorted by path, storage tries sorted by
+    /// hashed address (server guarantee).
+    pub fn proof(&self) -> ProofRef<'_> {
+        ResponseRef::decode(&self.body)
+            .ok()
+            .and_then(|r| r.proof())
+            .expect("validated in LookupClient::proof")
+    }
+
+    /// Response body size in bytes.
+    pub fn wire_len(&self) -> usize {
+        self.body.len()
+    }
+
+    /// An owned copy, one allocation per path and node.
+    pub fn to_read(&self) -> ProofRead {
+        let node = |n: NodeRef<'_>| ProofNode {
+            path: n.nibbles().collect(),
+            rlp: n.rlp.to_vec(),
+        };
+        let p = self.proof();
+        ProofRead {
+            account_nodes: p.account_nodes().map(node).collect(),
+            storages: p
+                .storages()
+                .map(|s| StorageProofRead {
+                    hashed_address: *s.hashed_address,
+                    storage_root: *s.storage_root,
+                    nodes: s.nodes.map(node).collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// One trie node of a proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProofNode {
+    /// One nibble per byte; empty = the trie root.
+    pub path: Vec<u8>,
+    pub rlp: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageProofRead {
+    pub hashed_address: Word,
+    pub storage_root: Word,
+    pub nodes: Vec<ProofNode>,
+}
+
+/// [`ProofFrame::to_read`]: a proof as owned values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProofRead {
+    pub account_nodes: Vec<ProofNode>,
+    pub storages: Vec<StorageProofRead>,
 }
 
 /// Counters (relaxed; for logs and benches).
@@ -211,9 +287,12 @@ impl LookupClient {
     }
 
     /// Sends one frame built for the allocated id; returns the raw body.
-    async fn round_trip(&self, build: impl FnOnce(u32) -> Vec<u8>) -> Result<Vec<u8>, LookupError> {
+    async fn round_trip(
+        &self,
+        timeout: Duration,
+        build: impl FnOnce(u32) -> Vec<u8>,
+    ) -> Result<Vec<u8>, LookupError> {
         let conn = self.live().ok_or(LookupError::Unavailable)?;
-        let timeout = self.shared.cfg.timeout;
         let deadline = tokio::time::Instant::now() + timeout;
         let _slot = tokio::time::timeout_at(deadline, conn.slots.acquire())
             .await
@@ -256,24 +335,17 @@ impl LookupClient {
             return Err(LookupError::TooManyItems);
         }
         let body = self
-            .round_trip(|id| {
+            .round_trip(self.shared.cfg.timeout, |id| {
                 let mut b = RequestBuilder::with_capacity(op, flags, id, pin, count);
                 push(&mut b);
                 b.finish()
             })
             .await?;
         let r = ResponseRef::decode(&body).map_err(|e| LookupError::Protocol(e.to_string()))?;
-        if r.status != Status::Ok {
-            return Err(LookupError::Status(r.status));
-        }
-        if r.op != op as u8 || r.flags != flags || r.count() != count {
+        check_answer(&r, op, flags, pin)?;
+        if r.count() != count {
             return Err(LookupError::Protocol(
                 "response does not match request".into(),
-            ));
-        }
-        if *pin != LATEST && r.read_hash != pin {
-            return Err(LookupError::Protocol(
-                "response read at a different block".into(),
             ));
         }
         Ok(body)
@@ -348,6 +420,43 @@ impl LookupClient {
         }))
     }
 
+    /// Multiproof for pre-hashed `(hashed_address, hashed_slots)` targets
+    /// (D10): the same read as `silt_multiproof`, in one frame. At most
+    /// `MAX_ITEMS` targets and `MAX_PROOF_SLOTS` slots
+    /// ([`LookupError::TooManyItems`] beyond — split, and merge the
+    /// answers yourself); `Status(TooLarge)` if the answer would exceed
+    /// `MAX_RESPONSE_BYTES`. Pins more than the server's proof depth
+    /// (default 8 blocks) below its latest answer `UnknownBlock`. Uses
+    /// [`LookupClientConfig::proof_timeout`].
+    pub async fn proof(
+        &self,
+        pin: &Word,
+        targets: &[(Word, Vec<Word>)],
+    ) -> Result<ProofFrame, LookupError> {
+        let slots: usize = targets.iter().map(|(_, s)| s.len()).sum();
+        if targets.len() > MAX_ITEMS || slots > MAX_PROOF_SLOTS {
+            return Err(LookupError::TooManyItems);
+        }
+        let body = self
+            .round_trip(self.shared.cfg.proof_timeout, |id| {
+                let mut b = RequestBuilder::with_capacity(Op::Proof, 0, id, pin, targets.len());
+                for (addr, slots) in targets {
+                    b.push_proof_target(addr, slots);
+                }
+                b.finish()
+            })
+            .await?;
+        let r = ResponseRef::decode(&body).map_err(|e| LookupError::Protocol(e.to_string()))?;
+        check_answer(&r, Op::Proof, 0, pin)?;
+        let (read_number, read_hash, server_us) = (r.read_number, *r.read_hash, r.server_us);
+        Ok(ProofFrame {
+            read_number,
+            read_hash,
+            server_us,
+            body,
+        })
+    }
+
     /// Bytecode by hash (immutable: safe to cache forever).
     pub async fn code(&self, pin: &Word, hashes: &[Word]) -> Result<Reply<CodeRead>, LookupError> {
         let body = self
@@ -365,6 +474,24 @@ impl LookupClient {
             _ => unreachable!("op checked in call()"),
         }))
     }
+}
+
+/// Status, op/flags echo and pin of a decoded answer.
+fn check_answer(r: &ResponseRef<'_>, op: Op, flags: u8, pin: &Word) -> Result<(), LookupError> {
+    if r.status != Status::Ok {
+        return Err(LookupError::Status(r.status));
+    }
+    if r.op != op as u8 || r.flags != flags {
+        return Err(LookupError::Protocol(
+            "response does not match request".into(),
+        ));
+    }
+    if *pin != LATEST && r.read_hash != pin {
+        return Err(LookupError::Protocol(
+            "response read at a different block".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Resolves once the connection is marked dead (the guard `wait_for`
@@ -615,7 +742,9 @@ mod tests {
     use super::*;
     use crate::{Cache, CacheConfig};
     use silt_wire::KECCAK_EMPTY;
-    use silt_wire::lookup::{Item, RequestRef, ResponseBuilder, read_body};
+    use silt_wire::lookup::{
+        Item, ProofBuilder, RequestRef, ResponseBuilder, pack_path, read_body,
+    };
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
 
@@ -644,11 +773,46 @@ mod tests {
             .map(|_| buf)
     }
 
+    /// Pin the mock answers `TooLarge` for (proofs).
+    const TOO_LARGE_PIN: Word = [0xEE; 32];
+
+    /// Deterministic proof: the account root, then one node per target at
+    /// the hashed address's first two nibbles; a storage trie (root
+    /// `[0x5A; 32]`) per target with slots, one node per slot.
+    fn answer_proof(req: &RequestRef<'_>, read: &Word) -> Vec<u8> {
+        if *req.pin == TOO_LARGE_PIN {
+            return lookup::error_response(4, 0, req.id, Status::TooLarge, 1);
+        }
+        let mut out = ProofBuilder::new(0, req.id, HEAD.0, read, 0);
+        out.push_account_node(0, &[], &[0xC0]);
+        let targets: Vec<_> = req
+            .items()
+            .map(|i| match i {
+                Item::Proof(t) => t,
+                _ => unreachable!(),
+            })
+            .collect();
+        for t in &targets {
+            let a = t.hashed_address[0];
+            out.push_account_node(2, &pack_path(&[a >> 4, a & 15]), &[a]);
+        }
+        for t in targets.iter().filter(|t| t.slot_count() > 0) {
+            out.begin_storage(t.hashed_address, &[0x5A; 32]);
+            for slot in t.slots() {
+                out.push_storage_node(1, &pack_path(&[slot[0] >> 4]), &[slot[0], 1]);
+            }
+        }
+        out.finish(4)
+    }
+
     /// Deterministic answers: storage value = slot; account nonce/balance
     /// from the address; `[0; 20]` is absent; CONTRACT has code.
     fn answer(body: &[u8]) -> Vec<u8> {
         let req = RequestRef::decode(body).unwrap();
         let read = if req.is_latest() { HEAD.1 } else { *req.pin };
+        if req.op == Op::Proof {
+            return answer_proof(&req, &read);
+        }
         let mut out = ResponseBuilder::new(req.op, req.flags, req.id, HEAD.0, &read, req.count());
         for item in req.items() {
             match item {
@@ -664,6 +828,7 @@ mod tests {
                     out.push_account(ItemStatus::Ok, a[0] as u64, &[a[0]; 32], &hash, code)
                 }
                 Item::Code(_) => out.push_code(ItemStatus::Absent, &[]),
+                Item::Proof(_) => unreachable!("answered by answer_proof"),
             }
         }
         out.finish(3)
@@ -733,6 +898,86 @@ mod tests {
         assert_eq!(accts.items[0].code.as_deref(), Some(&[0x60, 0x00][..]));
         assert_eq!(accts.items[1].status, ItemStatus::Absent);
         assert_eq!(accts.items[1].code_hash, KECCAK_EMPTY);
+        assert_eq!(client.stats().connects.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn proofs_decode_borrowed_and_owned_and_enforce_caps() {
+        let (l, addr) = listener().await;
+        tokio::spawn(async move {
+            let mut s = accept(&l).await;
+            while let Some(req) = next_request(&mut s).await {
+                s.write_all(&answer(&req)).await.unwrap();
+            }
+        });
+        let client = LookupClient::new(cfg(addr));
+        assert!(client.wait_connected(Duration::from_secs(5)).await);
+        let targets = vec![
+            ([0x12; 32], vec![[0x34; 32], [0xF0; 32]]),
+            ([0x56; 32], vec![]),
+        ];
+        let frame = client.proof(&HEAD.1, &targets).await.unwrap();
+        assert_eq!(
+            (frame.read_number, frame.read_hash, frame.server_us),
+            (HEAD.0, HEAD.1, 4)
+        );
+        let p = frame.proof();
+        let account: Vec<_> = p
+            .account_nodes()
+            .map(|n| (n.nibbles().collect::<Vec<_>>(), n.rlp.to_vec()))
+            .collect();
+        assert_eq!(
+            account,
+            [
+                (vec![], vec![0xC0]),
+                (vec![1, 2], vec![0x12]),
+                (vec![5, 6], vec![0x56])
+            ]
+        );
+        let owned = frame.to_read();
+        assert_eq!(owned.account_nodes.len(), 3);
+        assert_eq!(owned.storages.len(), 1, "only the target with slots");
+        let st = &owned.storages[0];
+        assert_eq!(
+            (st.hashed_address, st.storage_root),
+            ([0x12; 32], [0x5A; 32])
+        );
+        assert_eq!(
+            st.nodes,
+            [
+                ProofNode {
+                    path: vec![3],
+                    rlp: vec![0x34, 1]
+                },
+                ProofNode {
+                    path: vec![0xF],
+                    rlp: vec![0xF0, 1]
+                },
+            ]
+        );
+        assert!(frame.wire_len() > lookup::RESPONSE_HEADER);
+
+        // Caps are enforced before sending; the server's statuses come back.
+        let many = vec![([1; 32], vec![]); MAX_ITEMS + 1];
+        assert_eq!(
+            client.proof(&LATEST, &many).await,
+            Err(LookupError::TooManyItems)
+        );
+        let deep = vec![([1; 32], vec![[2; 32]; MAX_PROOF_SLOTS + 1])];
+        assert_eq!(
+            client.proof(&LATEST, &deep).await,
+            Err(LookupError::TooManyItems)
+        );
+        assert_eq!(
+            client.proof(&TOO_LARGE_PIN, &targets).await,
+            Err(LookupError::Status(Status::TooLarge))
+        );
+        // Lookups still work on the same connection.
+        let r = client
+            .storage(&LATEST, &[([1; 20], [9; 32])])
+            .await
+            .unwrap();
+        assert_eq!(r.items[0].value, [9; 32]);
         assert_eq!(client.stats().connects.load(Ordering::Relaxed), 1);
     }
 

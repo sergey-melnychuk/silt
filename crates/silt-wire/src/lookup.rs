@@ -1,5 +1,5 @@
-//! Lookup fast path (PLAN D9): a fixed little-endian request/response
-//! layout for tip-state reads, written by hand.
+//! Lookup fast path (PLAN D9, D10): a fixed little-endian request/response
+//! layout for tip-state reads and trie proofs, written by hand.
 //!
 //! No postcard, serde or varints here: every field sits at a fixed offset,
 //! so [`RequestRef::decode`] and [`ResponseRef::decode`] only check lengths
@@ -9,6 +9,7 @@
 //! ```text
 //! request  (40 B header): u8 op | u8 flags | u16 count | u32 id | [32] pin_hash | count × item
 //!   items: Account [20] addr | Storage [20] addr,[32] slot | Code [32] code_hash
+//!          Proof   [32] hashed_address, u16 slot_count, [2] reserved, slot_count × [32] hashed_slot
 //! response (56 B header): u8 op | u8 flags | u16 count | u32 id
 //!                         | u8 status | [3] reserved | u32 server_us
 //!                         | u64 read_number | [32] read_hash | count × result
@@ -16,6 +17,10 @@
 //!     Account: u64 nonce, [32] balance, [32] code_hash [+ u32 code_len, code iff INLINE_CODE]
 //!     Storage: [32] value
 //!     Code:    u32 len, bytes
+//!   Proof (count = storage tries; no per-item results):
+//!     u32 account_nodes, account_nodes × node,
+//!     count × ([32] hashed_address, [32] storage_root, u32 nodes, nodes × node)
+//!     node: u8 path_len (nibbles, ≤ 64), ⌈path_len/2⌉ packed path, u32 rlp_len (≥ 1), rlp
 //! ```
 //!
 //! Integers are little-endian; 32-byte words are opaque arrays exactly as in
@@ -47,6 +52,9 @@ pub const PREFIX: usize = 8;
 pub const ACCOUNT_ITEM: usize = 20;
 pub const STORAGE_ITEM: usize = 52;
 pub const CODE_ITEM: usize = 32;
+/// Fixed part of a Proof item: `hashed_address, slot_count, reserved`;
+/// `slot_count × 32` bytes of hashed slots follow.
+pub const PROOF_TARGET: usize = 32 + 2 + 2;
 
 /// `item_status, nonce, balance, code_hash` (+ `u32 code_len, code` inline).
 pub const ACCOUNT_RESULT: usize = 1 + 8 + 32 + 32;
@@ -59,8 +67,14 @@ pub const MAX_ITEMS: usize = 1024;
 /// Items per frame for Code and Account + `INLINE_CODE`: 64 × a 256 KiB
 /// contract still fits [`MAX_RESPONSE_BYTES`] (10× EIP-170 headroom).
 pub const MAX_CODE_ITEMS: usize = 64;
-/// Largest valid request body: a full Storage frame.
-pub const MAX_REQUEST_BYTES: usize = REQUEST_HEADER + MAX_ITEMS * STORAGE_ITEM;
+/// Hashed slots across all targets of one Proof frame (D10).
+pub const MAX_PROOF_SLOTS: usize = 4096;
+/// A trie path is at most 64 nibbles (a full 32-byte key).
+pub const MAX_PATH_NIBBLES: usize = 64;
+/// Largest valid request body: a full Proof frame (`MAX_ITEMS` targets
+/// carrying `MAX_PROOF_SLOTS` slots), larger than a full Storage frame.
+pub const MAX_REQUEST_BYTES: usize =
+    REQUEST_HEADER + MAX_ITEMS * PROOF_TARGET + MAX_PROOF_SLOTS * 32;
 /// Largest response body either side accepts or produces.
 pub const MAX_RESPONSE_BYTES: usize = 16 << 20;
 /// Requests a client may have decoded-but-unanswered per connection; the
@@ -73,6 +87,8 @@ pub enum Op {
     Account = 1,
     Storage = 2,
     Code = 3,
+    /// Multiproof for pre-hashed targets (D10).
+    Proof = 4,
 }
 
 impl Op {
@@ -81,24 +97,27 @@ impl Op {
             1 => Some(Self::Account),
             2 => Some(Self::Storage),
             3 => Some(Self::Code),
+            4 => Some(Self::Proof),
             _ => None,
         }
     }
 
-    /// Request item size.
+    /// Request item size; for `Proof`, the fixed part ([`PROOF_TARGET`]).
     pub const fn item_len(self) -> usize {
         match self {
             Self::Account => ACCOUNT_ITEM,
             Self::Storage => STORAGE_ITEM,
             Self::Code => CODE_ITEM,
+            Self::Proof => PROOF_TARGET,
         }
     }
 
-    /// Item cap for this op with these flags.
+    /// Item cap for this op with these flags (`Proof`: account targets;
+    /// its slots are capped by [`MAX_PROOF_SLOTS`]).
     pub const fn max_items(self, flags: u8) -> usize {
         match self {
             Self::Account if flags & FLAG_INLINE_CODE != 0 => MAX_CODE_ITEMS,
-            Self::Account | Self::Storage => MAX_ITEMS,
+            Self::Account | Self::Storage | Self::Proof => MAX_ITEMS,
             Self::Code => MAX_CODE_ITEMS,
         }
     }
@@ -116,6 +135,8 @@ pub enum Status {
     Internal = 3,
     /// Not attempted (in-flight cap or server overload): retry or fall back.
     Busy = 4,
+    /// The answer would exceed [`MAX_RESPONSE_BYTES`]: split the request.
+    TooLarge = 5,
 }
 
 impl Status {
@@ -126,6 +147,7 @@ impl Status {
             2 => Some(Self::BadRequest),
             3 => Some(Self::Internal),
             4 => Some(Self::Busy),
+            5 => Some(Self::TooLarge),
             _ => None,
         }
     }
@@ -172,6 +194,13 @@ pub enum DecodeError {
     ErrorWithItems,
     /// Length prefix outside `[min, max]`.
     BadLength(u32),
+    /// More hashed slots than [`MAX_PROOF_SLOTS`] in one Proof frame.
+    TooManySlots(usize),
+    /// A proof node path longer than 64 nibbles, or an odd path whose
+    /// padding nibble is not zero.
+    BadPath,
+    /// A proof node with an empty RLP encoding.
+    EmptyNode,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -187,6 +216,9 @@ impl std::fmt::Display for DecodeError {
             Self::TooManyItems(n) => write!(f, "{n} items exceed the frame cap"),
             Self::ErrorWithItems => write!(f, "non-Ok lookup response carries items"),
             Self::BadLength(len) => write!(f, "lookup frame length {len} out of bounds"),
+            Self::TooManySlots(n) => write!(f, "{n} proof slots exceed the frame cap"),
+            Self::BadPath => write!(f, "invalid proof node path"),
+            Self::EmptyNode => write!(f, "empty proof node"),
         }
     }
 }
@@ -238,6 +270,26 @@ pub enum Item<'a> {
     Account(&'a Addr),
     Storage(&'a Addr, &'a Word),
     Code(&'a Word),
+    Proof(ProofTarget<'a>),
+}
+
+/// One Proof target: a hashed address and the hashed slots to prove under
+/// it (none = account trie only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProofTarget<'a> {
+    pub hashed_address: &'a Word,
+    /// `slot_count × 32` bytes.
+    slots: &'a [u8],
+}
+
+impl<'a> ProofTarget<'a> {
+    pub fn slot_count(&self) -> usize {
+        self.slots.len() / 32
+    }
+
+    pub fn slots(&self) -> impl ExactSizeIterator<Item = &'a Word> + 'a {
+        self.slots.as_chunks::<32>().0.iter()
+    }
 }
 
 /// A validated request, borrowing the frame body. Decoding allocates
@@ -253,7 +305,8 @@ pub struct RequestRef<'a> {
 }
 
 impl<'a> RequestRef<'a> {
-    /// Validates op, flags, count cap and exact length.
+    /// Validates op, flags, count cap, Proof slot caps and reserved bytes,
+    /// and the exact length.
     pub fn decode(body: &'a [u8]) -> Result<Self, DecodeError> {
         if body.len() < REQUEST_HEADER {
             return Err(DecodeError::Truncated);
@@ -268,7 +321,11 @@ impl<'a> RequestRef<'a> {
             return Err(DecodeError::TooManyItems(count));
         }
         let items = &body[REQUEST_HEADER..];
-        let want = count as usize * op.item_len();
+        let want = if op == Op::Proof {
+            proof_items_len(items, count)?
+        } else {
+            count as usize * op.item_len()
+        };
         match items.len().cmp(&want) {
             std::cmp::Ordering::Less => return Err(DecodeError::Truncated),
             std::cmp::Ordering::Greater => return Err(DecodeError::TrailingBytes),
@@ -297,17 +354,78 @@ impl<'a> RequestRef<'a> {
     }
 
     /// Items in request order.
-    pub fn items(&self) -> impl ExactSizeIterator<Item = Item<'a>> + 'a {
-        let op = self.op;
-        self.items
-            .chunks_exact(op.item_len())
-            .map(move |chunk| match op {
-                Op::Account => Item::Account(addr_at(chunk, 0)),
-                Op::Storage => Item::Storage(addr_at(chunk, 0), word_at(chunk, 20)),
-                Op::Code => Item::Code(word_at(chunk, 0)),
-            })
+    pub fn items(&self) -> Items<'a> {
+        Items {
+            op: self.op,
+            left: self.count,
+            rest: self.items,
+        }
     }
 }
+
+/// Bytes `count` Proof items occupy at the start of `items`, validating
+/// each item's reserved bytes and the frame's slot cap. Stops at the first
+/// item that runs past the end (`decode` then reports `Truncated`).
+fn proof_items_len(items: &[u8], count: u16) -> Result<usize, DecodeError> {
+    let (mut at, mut slots) = (0usize, 0usize);
+    for _ in 0..count {
+        let Some(fixed) = items.get(at..at + PROOF_TARGET) else {
+            return Err(DecodeError::Truncated);
+        };
+        if fixed[34..36] != [0, 0] {
+            return Err(DecodeError::BadReserved);
+        }
+        let n = u16_at(fixed, 32) as usize;
+        slots += n;
+        if slots > MAX_PROOF_SLOTS {
+            return Err(DecodeError::TooManySlots(slots));
+        }
+        at += PROOF_TARGET + n * 32;
+    }
+    Ok(at)
+}
+
+/// Iterator over a decoded request's items.
+#[derive(Clone, Debug)]
+pub struct Items<'a> {
+    op: Op,
+    left: u16,
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for Items<'a> {
+    type Item = Item<'a>;
+
+    fn next(&mut self) -> Option<Item<'a>> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        let b = self.rest;
+        // Lengths were validated by `RequestRef::decode`.
+        let (item, used) = match self.op {
+            Op::Account => (Item::Account(addr_at(b, 0)), ACCOUNT_ITEM),
+            Op::Storage => (Item::Storage(addr_at(b, 0), word_at(b, 20)), STORAGE_ITEM),
+            Op::Code => (Item::Code(word_at(b, 0)), CODE_ITEM),
+            Op::Proof => {
+                let end = PROOF_TARGET + u16_at(b, 32) as usize * 32;
+                let target = ProofTarget {
+                    hashed_address: word_at(b, 0),
+                    slots: &b[PROOF_TARGET..end],
+                };
+                (Item::Proof(target), end)
+            }
+        };
+        self.rest = &b[used..];
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left as usize, Some(self.left as usize))
+    }
+}
+
+impl ExactSizeIterator for Items<'_> {}
 
 /// Builds one request frame, length prefix included, ready to write.
 #[derive(Clone, Debug)]
@@ -315,6 +433,8 @@ pub struct RequestBuilder {
     op: Op,
     flags: u8,
     count: u16,
+    /// Proof frames: hashed slots so far.
+    slots: usize,
     buf: Vec<u8>,
 }
 
@@ -333,6 +453,7 @@ impl RequestBuilder {
             op,
             flags,
             count: 0,
+            slots: 0,
             buf,
         }
     }
@@ -348,6 +469,12 @@ impl RequestBuilder {
     /// True once the frame holds its op's item cap.
     pub fn is_full(&self) -> bool {
         self.count as usize >= self.op.max_items(self.flags)
+    }
+
+    /// Whether one more Proof target with `slots` hashed slots fits (both
+    /// the target cap and [`MAX_PROOF_SLOTS`]).
+    pub fn fits_proof_target(&self, slots: usize) -> bool {
+        !self.is_full() && self.slots + slots <= MAX_PROOF_SLOTS
     }
 
     fn bump(&mut self, op: Op) {
@@ -375,11 +502,33 @@ impl RequestBuilder {
         self
     }
 
+    /// One Proof target. Panics past the caps (check
+    /// [`Self::fits_proof_target`]).
+    pub fn push_proof_target(&mut self, hashed_address: &Word, hashed_slots: &[Word]) -> &mut Self {
+        self.push_proof_raw(hashed_address, hashed_slots.as_flattened())
+    }
+
+    fn push_proof_raw(&mut self, hashed_address: &Word, slots: &[u8]) -> &mut Self {
+        let n = slots.len() / 32;
+        assert!(
+            self.slots + n <= MAX_PROOF_SLOTS,
+            "proof frame already holds its slot cap"
+        );
+        self.bump(Op::Proof);
+        self.slots += n;
+        self.buf.extend_from_slice(hashed_address);
+        self.buf.extend_from_slice(&(n as u16).to_le_bytes());
+        self.buf.extend_from_slice(&[0, 0]);
+        self.buf.extend_from_slice(slots);
+        self
+    }
+
     pub fn push(&mut self, item: Item<'_>) -> &mut Self {
         match item {
             Item::Account(addr) => self.push_account(addr),
             Item::Storage(addr, slot) => self.push_storage(addr, slot),
             Item::Code(hash) => self.push_code(hash),
+            Item::Proof(t) => self.push_proof_raw(t.hashed_address, t.slots),
         }
     }
 
@@ -419,6 +568,7 @@ impl ResponseBuilder {
             Op::Account => ACCOUNT_RESULT,
             Op::Storage => STORAGE_RESULT,
             Op::Code => CODE_RESULT_HEADER,
+            Op::Proof => panic!("Proof answers are built with ProofBuilder"),
         };
         let mut buf = Vec::with_capacity(4 + RESPONSE_HEADER + capacity * per_item);
         write_response_header(
@@ -499,6 +649,121 @@ impl ResponseBuilder {
         self.buf[4 + 12..4 + 16].copy_from_slice(&server_us.to_le_bytes());
         self.buf
     }
+}
+
+/// Builds one `Ok` Proof response frame (length prefix included): account
+/// trie nodes first, then each storage trie via [`Self::begin_storage`].
+/// Node counts, `count`, the length and `server_us` are patched as
+/// sections close and in [`Self::finish`].
+#[derive(Debug)]
+pub struct ProofBuilder {
+    count: u16,
+    buf: Vec<u8>,
+    /// Offset of the node count of the section being filled.
+    nodes_at: usize,
+    nodes: u32,
+    in_storage: bool,
+}
+
+impl ProofBuilder {
+    /// `capacity`: expected body bytes after the header.
+    pub fn new(flags: u8, id: u32, read_number: u64, read_hash: &Word, capacity: usize) -> Self {
+        let mut buf = Vec::with_capacity(4 + RESPONSE_HEADER + 4 + capacity);
+        write_response_header(
+            &mut buf,
+            Op::Proof as u8,
+            flags,
+            id,
+            Status::Ok,
+            read_number,
+            read_hash,
+        );
+        let nodes_at = buf.len();
+        buf.extend_from_slice(&[0; 4]);
+        Self {
+            count: 0,
+            buf,
+            nodes_at,
+            nodes: 0,
+            in_storage: false,
+        }
+    }
+
+    fn close_section(&mut self) {
+        self.buf[self.nodes_at..self.nodes_at + 4].copy_from_slice(&self.nodes.to_le_bytes());
+    }
+
+    fn push_node(&mut self, path_len: usize, packed: &[u8], rlp: &[u8]) {
+        assert!(path_len <= MAX_PATH_NIBBLES, "path longer than 64 nibbles");
+        assert_eq!(packed.len(), path_len.div_ceil(2), "packed path length");
+        assert!(
+            path_len.is_multiple_of(2) || packed[packed.len() - 1] & 0x0F == 0,
+            "odd path padding nibble must be zero"
+        );
+        assert!(!rlp.is_empty(), "empty proof node");
+        self.nodes = self.nodes.checked_add(1).expect("u32 node count");
+        self.buf.push(path_len as u8);
+        self.buf.extend_from_slice(packed);
+        self.buf
+            .extend_from_slice(&(rlp.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(rlp);
+    }
+
+    /// An account trie node; all of them come before the first storage
+    /// trie. `packed`: `path_len` nibbles packed as by [`pack_path`].
+    pub fn push_account_node(&mut self, path_len: usize, packed: &[u8], rlp: &[u8]) {
+        assert!(!self.in_storage, "account nodes come before storage tries");
+        self.push_node(path_len, packed, rlp);
+    }
+
+    /// Opens the next storage trie section.
+    pub fn begin_storage(&mut self, hashed_address: &Word, storage_root: &Word) {
+        self.close_section();
+        self.in_storage = true;
+        self.count = self.count.checked_add(1).expect("u16 storage count");
+        self.buf.extend_from_slice(hashed_address);
+        self.buf.extend_from_slice(storage_root);
+        self.nodes_at = self.buf.len();
+        self.buf.extend_from_slice(&[0; 4]);
+        self.nodes = 0;
+    }
+
+    /// A node of the storage trie opened last.
+    pub fn push_storage_node(&mut self, path_len: usize, packed: &[u8], rlp: &[u8]) {
+        assert!(self.in_storage, "no storage trie open");
+        self.push_node(path_len, packed, rlp);
+    }
+
+    /// Body bytes so far (compare against [`MAX_RESPONSE_BYTES`]).
+    pub fn body_len(&self) -> usize {
+        self.buf.len() - 4
+    }
+
+    pub fn finish(mut self, server_us: u32) -> Vec<u8> {
+        self.close_section();
+        let body = (self.buf.len() - 4) as u32;
+        self.buf[0..4].copy_from_slice(&body.to_le_bytes());
+        self.buf[4 + 2..4 + 4].copy_from_slice(&self.count.to_le_bytes());
+        self.buf[4 + 12..4 + 16].copy_from_slice(&server_us.to_le_bytes());
+        self.buf
+    }
+}
+
+/// Packs a one-nibble-per-byte path (each `< 16`, at most 64) the way
+/// proof nodes carry it: high nibble first, an odd path's last low nibble
+/// zero.
+pub fn pack_path(nibbles: &[u8]) -> Vec<u8> {
+    assert!(
+        nibbles.len() <= MAX_PATH_NIBBLES,
+        "path longer than 64 nibbles"
+    );
+    nibbles
+        .chunks(2)
+        .map(|pair| {
+            assert!(pair.iter().all(|&n| n < 16), "nibble out of range");
+            pair[0] << 4 | pair.get(1).copied().unwrap_or(0)
+        })
+        .collect()
 }
 
 fn write_response_header(
@@ -606,6 +871,10 @@ impl<'a> ResponseRef<'a> {
         if count as usize > op.max_items(flags) {
             return Err(DecodeError::TooManyItems(count));
         }
+        if op == Op::Proof {
+            check_proof(results, count)?;
+            return Ok(resp);
+        }
         // One validating walk; `results()` can then index without checks.
         let mut at = 0usize;
         for _ in 0..count {
@@ -629,6 +898,7 @@ impl<'a> ResponseRef<'a> {
                         .ok_or(DecodeError::Truncated)?;
                     (results.get(at).copied(), CODE_RESULT_HEADER + code_len)
                 }
+                Op::Proof => unreachable!("validated by check_proof"),
             };
             let status_byte = status_byte.ok_or(DecodeError::Truncated)?;
             ItemStatus::from_u8(status_byte).ok_or(DecodeError::BadItemStatus(status_byte))?;
@@ -647,12 +917,14 @@ impl<'a> ResponseRef<'a> {
         self.count as usize
     }
 
-    /// Results in request order (empty unless `status == Ok`).
+    /// Results in request order (empty unless `status == Ok`; always empty
+    /// for `Proof`, see [`Self::proof`]).
     pub fn results(&self) -> Results<'a> {
+        let op = Op::from_u8(self.op);
         Results {
-            op: Op::from_u8(self.op),
+            op,
             inline_code: self.flags & FLAG_INLINE_CODE != 0,
-            left: if self.status == Status::Ok {
+            left: if self.status == Status::Ok && op != Some(Op::Proof) {
                 self.count
             } else {
                 0
@@ -660,7 +932,219 @@ impl<'a> ResponseRef<'a> {
             rest: self.results,
         }
     }
+
+    /// The proof of an `Ok` Proof response.
+    pub fn proof(&self) -> Option<ProofRef<'a>> {
+        (self.status == Status::Ok && self.op == Op::Proof as u8)
+            .then(|| ProofRef::new(self.results, self.count))
+    }
 }
+
+/// Validates the node list starting at `at` (`u32` count, then nodes);
+/// returns the offset after it.
+fn check_nodes(b: &[u8], mut at: usize) -> Result<usize, DecodeError> {
+    let n = b
+        .get(at..at + 4)
+        .map(|x| u32_at(x, 0))
+        .ok_or(DecodeError::Truncated)?;
+    at += 4;
+    for _ in 0..n {
+        let path_len = *b.get(at).ok_or(DecodeError::Truncated)? as usize;
+        if path_len > MAX_PATH_NIBBLES {
+            return Err(DecodeError::BadPath);
+        }
+        let packed = path_len.div_ceil(2);
+        let path = b
+            .get(at + 1..at + 1 + packed)
+            .ok_or(DecodeError::Truncated)?;
+        if !path_len.is_multiple_of(2) && path[packed - 1] & 0x0F != 0 {
+            return Err(DecodeError::BadPath);
+        }
+        at += 1 + packed;
+        let rlp_len = b
+            .get(at..at + 4)
+            .map(|x| u32_at(x, 0) as usize)
+            .ok_or(DecodeError::Truncated)?;
+        if rlp_len == 0 {
+            return Err(DecodeError::EmptyNode);
+        }
+        at = at
+            .checked_add(4 + rlp_len)
+            .filter(|&end| end <= b.len())
+            .ok_or(DecodeError::Truncated)?;
+    }
+    Ok(at)
+}
+
+/// Validates a whole Proof body: account nodes, then `count` storage tries,
+/// nothing after.
+fn check_proof(results: &[u8], count: u16) -> Result<(), DecodeError> {
+    let mut at = check_nodes(results, 0)?;
+    for _ in 0..count {
+        if results.len() < at + 64 {
+            return Err(DecodeError::Truncated);
+        }
+        at = check_nodes(results, at + 64)?;
+    }
+    if at != results.len() {
+        return Err(DecodeError::TrailingBytes);
+    }
+    Ok(())
+}
+
+/// Bytes `n` validated nodes occupy at the start of `b`.
+fn nodes_len(b: &[u8], n: u32) -> usize {
+    let mut at = 0;
+    for _ in 0..n {
+        let packed = (b[at] as usize).div_ceil(2);
+        at += 1 + packed;
+        at += 4 + u32_at(b, at) as usize;
+    }
+    at
+}
+
+/// A validated proof, borrowing the frame.
+#[derive(Clone, Copy, Debug)]
+pub struct ProofRef<'a> {
+    account: &'a [u8],
+    account_nodes: u32,
+    storages: &'a [u8],
+    storage_count: u16,
+}
+
+impl<'a> ProofRef<'a> {
+    fn new(results: &'a [u8], count: u16) -> Self {
+        let n = u32_at(results, 0);
+        let end = 4 + nodes_len(&results[4..], n);
+        Self {
+            account: &results[4..end],
+            account_nodes: n,
+            storages: &results[end..],
+            storage_count: count,
+        }
+    }
+
+    /// Account trie nodes, sorted by path (server guarantee).
+    pub fn account_nodes(&self) -> Nodes<'a> {
+        Nodes {
+            left: self.account_nodes,
+            rest: self.account,
+        }
+    }
+
+    /// Storage tries, sorted by hashed address (server guarantee).
+    pub fn storages(&self) -> Storages<'a> {
+        Storages {
+            left: self.storage_count,
+            rest: self.storages,
+        }
+    }
+}
+
+/// One trie node: its path and RLP encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeRef<'a> {
+    /// In nibbles (`0` = the trie root).
+    pub path_len: u8,
+    /// `⌈path_len / 2⌉` bytes, high nibble first.
+    pub packed_path: &'a [u8],
+    pub rlp: &'a [u8],
+}
+
+impl<'a> NodeRef<'a> {
+    /// The path, one nibble per item.
+    pub fn nibbles(&self) -> impl ExactSizeIterator<Item = u8> + 'a {
+        let packed = self.packed_path;
+        (0..self.path_len as usize).map(move |i| {
+            let byte = packed[i / 2];
+            if i.is_multiple_of(2) {
+                byte >> 4
+            } else {
+                byte & 0x0F
+            }
+        })
+    }
+}
+
+/// Iterator over a validated node list.
+#[derive(Clone, Debug)]
+pub struct Nodes<'a> {
+    left: u32,
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for Nodes<'a> {
+    type Item = NodeRef<'a>;
+
+    fn next(&mut self) -> Option<NodeRef<'a>> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        let b = self.rest;
+        let path_len = b[0];
+        let packed = (path_len as usize).div_ceil(2);
+        let rlp_at = 1 + packed + 4;
+        let rlp_len = u32_at(b, 1 + packed) as usize;
+        self.rest = &b[rlp_at + rlp_len..];
+        Some(NodeRef {
+            path_len,
+            packed_path: &b[1..1 + packed],
+            rlp: &b[rlp_at..rlp_at + rlp_len],
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left as usize, Some(self.left as usize))
+    }
+}
+
+impl ExactSizeIterator for Nodes<'_> {}
+
+/// One storage trie of a proof.
+#[derive(Clone, Debug)]
+pub struct StorageRef<'a> {
+    pub hashed_address: &'a Word,
+    pub storage_root: &'a Word,
+    /// Sorted by path (server guarantee).
+    pub nodes: Nodes<'a>,
+}
+
+/// Iterator over a validated proof's storage tries.
+#[derive(Clone, Debug)]
+pub struct Storages<'a> {
+    left: u16,
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for Storages<'a> {
+    type Item = StorageRef<'a>;
+
+    fn next(&mut self) -> Option<StorageRef<'a>> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        let b = self.rest;
+        let n = u32_at(b, 64);
+        let end = 68 + nodes_len(&b[68..], n);
+        self.rest = &b[end..];
+        Some(StorageRef {
+            hashed_address: word_at(b, 0),
+            storage_root: word_at(b, 32),
+            nodes: Nodes {
+                left: n,
+                rest: &b[68..end],
+            },
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left as usize, Some(self.left as usize))
+    }
+}
+
+impl ExactSizeIterator for Storages<'_> {}
 
 /// Iterator over a decoded response's results.
 #[derive(Clone, Debug)]
@@ -719,6 +1203,7 @@ impl<'a> Iterator for Results<'a> {
                     CODE_RESULT_HEADER + len,
                 )
             }
+            Op::Proof => unreachable!("Proof responses have no per-item results"),
         };
         self.rest = &b[used..];
         Some(result)
@@ -1006,10 +1491,11 @@ mod tests {
         Account(Addr),
         Storage(Addr, Word),
         Code(Word),
+        Proof(Word, Vec<Word>),
     }
 
     fn random_request(rng: &mut Rng) -> (Op, u8, u32, Word, Vec<OwnedItem>) {
-        let op = Op::from_u8(1 + rng.below(3) as u8).unwrap();
+        let op = Op::from_u8(1 + rng.below(4) as u8).unwrap();
         let flags = if op == Op::Account && rng.below(2) == 0 {
             FLAG_INLINE_CODE
         } else {
@@ -1021,11 +1507,22 @@ mod tests {
             rng.word()
         };
         let n = rng.count(op.max_items(flags));
+        let mut slots_left = MAX_PROOF_SLOTS;
         let items = (0..n)
             .map(|_| match op {
                 Op::Account => OwnedItem::Account(rng.addr()),
                 Op::Storage => OwnedItem::Storage(rng.addr(), rng.word()),
                 Op::Code => OwnedItem::Code(rng.word()),
+                Op::Proof => {
+                    // Mostly a few slots, sometimes many, never past the cap.
+                    let want = match rng.below(20) {
+                        0 => rng.below(600) as usize,
+                        _ => rng.below(5) as usize,
+                    };
+                    let k = want.min(slots_left);
+                    slots_left -= k;
+                    OwnedItem::Proof(rng.word(), (0..k).map(|_| rng.word()).collect())
+                }
             })
             .collect();
         (op, flags, rng.next() as u32, pin, items)
@@ -1038,6 +1535,7 @@ mod tests {
                 OwnedItem::Account(a) => b.push_account(a),
                 OwnedItem::Storage(a, s) => b.push_storage(a, s),
                 OwnedItem::Code(h) => b.push_code(h),
+                OwnedItem::Proof(a, slots) => b.push_proof_target(a, slots),
             };
         }
         b.finish()
@@ -1065,6 +1563,10 @@ mod tests {
                     Item::Account(a) => OwnedItem::Account(*a),
                     Item::Storage(a, s) => OwnedItem::Storage(*a, *s),
                     Item::Code(h) => OwnedItem::Code(*h),
+                    Item::Proof(t) => {
+                        assert_eq!(t.slots().len(), t.slot_count());
+                        OwnedItem::Proof(*t.hashed_address, t.slots().copied().collect())
+                    }
                 })
                 .collect();
             assert_eq!(back, items, "iteration {i}");
@@ -1102,7 +1604,7 @@ mod tests {
             0
         };
         let status = if rng.below(5) == 0 {
-            Status::from_u8(1 + rng.below(4) as u8).unwrap()
+            Status::from_u8(1 + rng.below(5) as u8).unwrap()
         } else {
             Status::Ok
         };
@@ -1119,6 +1621,7 @@ mod tests {
                     ),
                     Op::Storage => OwnedResult::Storage(item_status(rng), rng.word()),
                     Op::Code => OwnedResult::Code(item_status(rng), rng.bytes(300)),
+                    Op::Proof => unreachable!("ops 1-3 only; proofs: random_proof"),
                 })
                 .collect();
             (rng.next(), rng.word(), results)
@@ -1203,6 +1706,95 @@ mod tests {
         }
     }
 
+    /// Owned model of a proof (test-only): nodes as (nibbles, rlp).
+    type OwnedNodes = Vec<(Vec<u8>, Vec<u8>)>;
+
+    #[derive(Debug, PartialEq)]
+    struct ProofModel {
+        account: OwnedNodes,
+        storages: Vec<(Word, Word, OwnedNodes)>,
+    }
+
+    fn random_nodes(rng: &mut Rng, max: usize) -> OwnedNodes {
+        let n = rng.count(max);
+        (0..n)
+            .map(|_| {
+                let len = match rng.below(8) {
+                    0 => 0,
+                    1 => MAX_PATH_NIBBLES,
+                    _ => rng.below(MAX_PATH_NIBBLES as u64 + 1) as usize,
+                };
+                let path = (0..len).map(|_| rng.below(16) as u8).collect();
+                let mut rlp = rng.bytes(120);
+                if rlp.is_empty() {
+                    rlp.push(0x80);
+                }
+                (path, rlp)
+            })
+            .collect()
+    }
+
+    fn random_proof(rng: &mut Rng) -> ProofModel {
+        ProofModel {
+            account: random_nodes(rng, 60),
+            storages: (0..rng.count(12))
+                .map(|_| (rng.word(), rng.word(), random_nodes(rng, 20)))
+                .collect(),
+        }
+    }
+
+    fn encode_proof(m: &ProofModel, id: u32, read_number: u64, read_hash: &Word) -> Vec<u8> {
+        let mut b = ProofBuilder::new(0, id, read_number, read_hash, 0);
+        for (path, rlp) in &m.account {
+            b.push_account_node(path.len(), &pack_path(path), rlp);
+        }
+        for (addr, root, nodes) in &m.storages {
+            b.begin_storage(addr, root);
+            for (path, rlp) in nodes {
+                b.push_storage_node(path.len(), &pack_path(path), rlp);
+            }
+        }
+        b.finish(42)
+    }
+
+    fn owned_nodes(nodes: Nodes<'_>) -> OwnedNodes {
+        nodes
+            .map(|n| {
+                assert_eq!(n.nibbles().len(), n.path_len as usize);
+                (n.nibbles().collect(), n.rlp.to_vec())
+            })
+            .collect()
+    }
+
+    fn owned_proof(p: ProofRef<'_>) -> ProofModel {
+        ProofModel {
+            account: owned_nodes(p.account_nodes()),
+            storages: p
+                .storages()
+                .map(|s| (*s.hashed_address, *s.storage_root, owned_nodes(s.nodes)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn roundtrip_3k_random_proofs() {
+        let mut rng = Rng(0xD10D_10D1_0D10_D10D);
+        for i in 0..3_000 {
+            let m = random_proof(&mut rng);
+            let (id, number, hash) = (rng.next() as u32, rng.next(), rng.word());
+            let frame = encode_proof(&m, id, number, &hash);
+            let resp = ResponseRef::decode(body(&frame)).unwrap_or_else(|e| panic!("{i}: {e}"));
+            assert_eq!(
+                (resp.op, resp.flags, resp.id, resp.status, resp.server_us),
+                (Op::Proof as u8, 0, id, Status::Ok, 42)
+            );
+            assert_eq!((resp.read_number, *resp.read_hash), (number, hash));
+            assert_eq!(resp.count(), m.storages.len());
+            assert_eq!(resp.results().count(), 0, "no per-item results");
+            assert_eq!(owned_proof(resp.proof().unwrap()), m, "iteration {i}");
+        }
+    }
+
     /// Cut points for a body of `len` bytes: every cut through the first
     /// and last 256 bytes (headers, first/last items) plus 64 random ones.
     fn cuts(rng: &mut Rng, len: usize) -> Vec<usize> {
@@ -1244,6 +1836,18 @@ mod tests {
             let mut long = b.to_vec();
             long.push(rng.next() as u8);
             assert!(ResponseRef::decode(&long).is_err(), "resp {i} extended");
+
+            let frame = encode_proof(&random_proof(&mut rng), 1, 2, &[3; 32]);
+            let b = body(&frame);
+            for cut in cuts(&mut rng, b.len()) {
+                assert!(
+                    ResponseRef::decode(&b[..cut]).is_err(),
+                    "proof {i} cut {cut}"
+                );
+            }
+            let mut long = b.to_vec();
+            long.push(rng.next() as u8);
+            assert!(ResponseRef::decode(&long).is_err(), "proof {i} extended");
         }
     }
 
@@ -1255,6 +1859,7 @@ mod tests {
             (Op::Account, FLAG_INLINE_CODE),
             (Op::Storage, 0),
             (Op::Code, 0),
+            (Op::Proof, 0),
         ] {
             let cap = op.max_items(flags);
             let mut b = RequestBuilder::new(op, flags, 1, &LATEST).finish();
@@ -1265,17 +1870,47 @@ mod tests {
                 DecodeError::TooManyItems(cap as u16 + 1)
             );
         }
-        assert_eq!(MAX_REQUEST_BYTES, 53_288);
+        assert_eq!(MAX_REQUEST_BYTES, 167_976);
         assert!(check_len(MAX_REQUEST_BYTES as u32, MAX_REQUEST_BYTES).is_ok());
         assert!(check_len(MAX_REQUEST_BYTES as u32 + 1, MAX_REQUEST_BYTES).is_err());
         assert!(check_len(PREFIX as u32 - 1, MAX_REQUEST_BYTES).is_err());
         assert!(check_len(u32::MAX, MAX_RESPONSE_BYTES).is_err());
-        // A full storage frame is exactly the request cap.
+        // A full storage frame fits; a full proof frame is exactly the cap.
         let mut b = RequestBuilder::new(Op::Storage, 0, 1, &LATEST);
         while !b.is_full() {
             b.push_storage(&[1; 20], &[2; 32]);
         }
-        assert_eq!(b.finish().len() - 4, MAX_REQUEST_BYTES);
+        assert_eq!(b.finish().len() - 4, 53_288);
+        let mut b = RequestBuilder::new(Op::Proof, 0, 1, &LATEST);
+        let slots = vec![[2; 32]; MAX_PROOF_SLOTS / MAX_ITEMS];
+        while b.fits_proof_target(slots.len()) {
+            b.push_proof_target(&[1; 32], &slots);
+        }
+        assert!(b.is_full());
+        let full = b.finish();
+        assert_eq!(full.len() - 4, MAX_REQUEST_BYTES);
+        assert_eq!(RequestRef::decode(&full[4..]).unwrap().count(), MAX_ITEMS);
+        // One slot past the cap: the last target claims an extra slot.
+        let mut b = RequestBuilder::new(Op::Proof, 0, 1, &LATEST);
+        b.push_proof_target(&[1; 32], &vec![[2; 32]; MAX_PROOF_SLOTS]);
+        assert!(!b.fits_proof_target(1));
+        let mut over = b.finish()[4..].to_vec();
+        over[2..4].copy_from_slice(&2u16.to_le_bytes()); // body: count at 2..4
+        over.extend_from_slice(&[9; 32]);
+        over.extend_from_slice(&1u16.to_le_bytes());
+        over.extend_from_slice(&[0, 0]);
+        over.extend_from_slice(&[7; 32]);
+        assert_eq!(
+            RequestRef::decode(&over).unwrap_err(),
+            DecodeError::TooManySlots(MAX_PROOF_SLOTS + 1)
+        );
+        // A proof answer may carry at most MAX_ITEMS storage tries.
+        let mut r = ProofBuilder::new(0, 1, 1, &[1; 32], 0).finish(0)[4..].to_vec();
+        r[2..4].copy_from_slice(&(MAX_ITEMS as u16 + 1).to_le_bytes());
+        assert_eq!(
+            ResponseRef::decode(&r).unwrap_err(),
+            DecodeError::TooManyItems(MAX_ITEMS as u16 + 1)
+        );
     }
 
     #[test]
@@ -1284,8 +1919,8 @@ mod tests {
         let mut b = good[4..].to_vec();
         b[0] = 0;
         assert_eq!(RequestRef::decode(&b).unwrap_err(), DecodeError::BadOp(0));
-        b[0] = 4;
-        assert_eq!(RequestRef::decode(&b).unwrap_err(), DecodeError::BadOp(4));
+        b[0] = 5;
+        assert_eq!(RequestRef::decode(&b).unwrap_err(), DecodeError::BadOp(5));
         let mut b = good[4..].to_vec();
         b[1] = FLAG_INLINE_CODE; // inline code on a Storage op
         assert_eq!(
@@ -1326,6 +1961,54 @@ mod tests {
         assert_eq!(
             ResponseRef::decode(&r).unwrap_err(),
             DecodeError::ErrorWithItems
+        );
+
+        // Proof requests: no flags, zero reserved bytes.
+        let mut b = RequestBuilder::new(Op::Proof, 0, 9, &LATEST);
+        b.push_proof_target(&[1; 32], &[[2; 32]]);
+        let good = b.finish()[4..].to_vec();
+        let mut b = good.clone();
+        b[1] = FLAG_INLINE_CODE;
+        assert_eq!(
+            RequestRef::decode(&b).unwrap_err(),
+            DecodeError::BadFlags(FLAG_INLINE_CODE)
+        );
+        let mut b = good.clone();
+        b[REQUEST_HEADER + 34] = 1;
+        assert_eq!(
+            RequestRef::decode(&b).unwrap_err(),
+            DecodeError::BadReserved
+        );
+
+        // Proof answers: path ≤ 64 nibbles, zero padding nibble, non-empty
+        // RLP. Body after the header: u32 count, u8 path_len, path, u32
+        // rlp_len, rlp.
+        let mut p = ProofBuilder::new(0, 9, 1, &[1; 32], 0);
+        p.push_account_node(3, &pack_path(&[1, 2, 3]), &[0xC0]);
+        let good = p.finish(0)[4..].to_vec();
+        let node = RESPONSE_HEADER + 4;
+        assert_eq!(&good[node..node + 3], &[3, 0x12, 0x30]);
+        let mut r = good.clone();
+        r[node + 2] = 0x31; // padding nibble
+        assert_eq!(ResponseRef::decode(&r).unwrap_err(), DecodeError::BadPath);
+        let mut r = good.clone();
+        r[node] = 65;
+        assert_eq!(ResponseRef::decode(&r).unwrap_err(), DecodeError::BadPath);
+        let mut r = good.clone();
+        r[node + 3..node + 7].copy_from_slice(&0u32.to_le_bytes());
+        r.remove(node + 7);
+        assert_eq!(ResponseRef::decode(&r).unwrap_err(), DecodeError::EmptyNode);
+        // Status 5 is TooLarge, 6 is unknown.
+        let r = error_response(4, 0, 9, Status::TooLarge, 0);
+        assert_eq!(
+            ResponseRef::decode(&r[4..]).unwrap().status,
+            Status::TooLarge
+        );
+        let mut r = r[4..].to_vec();
+        r[8] = 6;
+        assert_eq!(
+            ResponseRef::decode(&r).unwrap_err(),
+            DecodeError::BadStatus(6)
         );
     }
 
@@ -1371,6 +2054,40 @@ mod tests {
             "no code is KECCAK_EMPTY, never zero"
         );
         assert_eq!(&absent[73..77], &0u32.to_le_bytes());
+
+        // Proof (D10): target = hashed address, u16 slot count, 2 reserved
+        // bytes, slots; answer = account nodes, then storage tries.
+        let mut b = RequestBuilder::new(Op::Proof, 0, 5, &LATEST);
+        b.push_proof_target(&[0x11; 32], &[[0x22; 32], [0x33; 32]]);
+        b.push_proof_target(&[0x44; 32], &[]);
+        let f = b.finish();
+        assert_eq!(&f[..4], &(40u32 + 36 + 64 + 36).to_le_bytes());
+        assert_eq!(&f[4..12], &[4, 0, 2, 0, 5, 0, 0, 0]);
+        let t = &f[44..];
+        assert_eq!(&t[..32], &[0x11; 32]);
+        assert_eq!(&t[32..36], &[2, 0, 0, 0]);
+        assert_eq!(&t[36..68], &[0x22; 32]);
+        assert_eq!(&t[68..100], &[0x33; 32]);
+        assert_eq!(&t[100..132], &[0x44; 32]);
+        assert_eq!(&t[132..136], &[0, 0, 0, 0]);
+
+        let mut p = ProofBuilder::new(0, 5, 0x0102, &[0xCD; 32], 0);
+        p.push_account_node(0, &[], &[0xF8, 0x51]);
+        p.push_account_node(1, &pack_path(&[0xA]), &[0xC2]);
+        p.begin_storage(&[0x11; 32], &[0x55; 32]);
+        p.push_storage_node(2, &pack_path(&[0x1, 0x2]), &[0xE1]);
+        let f = p.finish(7);
+        let body = &f[4..];
+        assert_eq!(&body[..8], &[4, 0, 1, 0, 5, 0, 0, 0]); // count = 1 storage trie
+        let r = &body[RESPONSE_HEADER..];
+        assert_eq!(&r[..4], &2u32.to_le_bytes()); // account nodes
+        assert_eq!(&r[4..11], &[0, 2, 0, 0, 0, 0xF8, 0x51]); // root: no path
+        assert_eq!(&r[11..18], &[1, 0xA0, 1, 0, 0, 0, 0xC2]); // odd: low nibble 0
+        assert_eq!(&r[18..50], &[0x11; 32]);
+        assert_eq!(&r[50..82], &[0x55; 32]);
+        assert_eq!(&r[82..86], &1u32.to_le_bytes());
+        assert_eq!(&r[86..93], &[2, 0x12, 1, 0, 0, 0, 0xE1]);
+        assert_eq!(r.len(), 93);
 
         let e = error_response(9, 0x80, 3, Status::BadRequest, 1);
         assert_eq!(e.len(), 4 + RESPONSE_HEADER);

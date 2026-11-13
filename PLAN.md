@@ -82,8 +82,8 @@ yevm's trait. The core crate has **no yevm dependency**.
   - **Handshake** = the feed's: `Frame::Hello` both ways (postcard,
     exact `VERSION` match, server first), `Refused` + close on mismatch;
     then the connection switches to lookup frames. The lookup layout is
-    covered by the same `VERSION`; it stays `0` (the feed wire is
-    unchanged) and any change to either protocol bumps it.
+    covered by the same `VERSION`. It was `0` at D9 and is `1` since D10
+    (op 4, status 5); any change to either protocol bumps it.
   - **Lookup frames**: the same `u32` LE length prefix, then a fixed
     little-endian layout (`silt_wire::lookup`, hand-written, reth-free):
     no postcard/serde/varints on the hot path, and request decoding is
@@ -128,7 +128,7 @@ yevm's trait. The core crate has **no yevm dependency**.
     `Ok` + empty without a read; an unknown hash answers `Absent`. Code is
     immutable per hash, so clients may cache `Code` results forever.
   - **Statuses.** Frame: `Ok 0`, `UnknownBlock 1`, `BadRequest 2`,
-    `Internal 3`, `Busy 4`. Any non-`Ok` frame carries `count = 0`, zero
+    `Internal 3`, `Busy 4`, and `TooLarge 5` (since D10). Any non-`Ok` frame carries `count = 0`, zero
     `read_number`/`read_hash`, and no results. Item: `Ok 0`, `Absent 1`,
     `Error 2`. `Ok` and `Absent` both mean the payload is valid; on
     `Error` (one key's read failed, the others still answer) the payload
@@ -139,7 +139,9 @@ yevm's trait. The core crate has **no yevm dependency**.
     `Account + INLINE_CODE`; `MAX_REQUEST_BYTES = 40 + 1024 × 52 = 53 288`;
     `MAX_RESPONSE_BYTES = 16 MiB` (64 × a 256 KiB contract still fits,
     10× headroom over EIP-170; a response that would exceed it answers
-    `Internal`); `MAX_INFLIGHT = 256` requests per connection. A length
+    `TooLarge`, which was `Internal` before D10); `MAX_INFLIGHT = 256`
+    requests per connection. (D10 raises `MAX_REQUEST_BYTES` for proof
+    frames.) A length
     prefix below 8 or above `MAX_REQUEST_BYTES` closes the connection
     (the stream can't be trusted); a frame with a readable `op`+`id` that
     fails any other check answers `BadRequest` with the id echoed.
@@ -215,6 +217,69 @@ yevm's trait. The core crate has **no yevm dependency**.
     overlay pinned at the state frontier. Both implement one small
     `StateSource` trait in `silt-node/src/lookup.rs`, so the server code
     is shared and testable without reth.
+- **D10 — Proofs take the binary fast path too: op `Proof = 4` on the D9
+  listener.** With D9, a builder's state reads no longer need reth's
+  database; the last reads that did were trie nodes for its state root.
+  `silt_multiproof` (D8) answers them, but as JSON-RPC: hex doubles the
+  bytes, and encoding, HTTP and parsing cost 17% of a block-sized proof
+  and 30–52% of a single-account or single-slot fetch
+  (`docs/proof-bench.md`). Those small fetches are what a builder whose
+  sparse trie is kept warm by the feed sends: it reveals only the nodes
+  it hasn't seen. Op 4 carries exactly D8's read (pre-hashed,
+  path-directed targets; reth's `StateProofProvider::multiproof`; the
+  same nodes) in D9's framing, handshake, pinning, in-flight accounting
+  and `server_us`. `silt_multiproof` stays for JSON consumers.
+  - **Layout** (fixed LE, as D9; decoders validate every length and walk
+    once without allocating):
+
+    ```
+    request:  40 B header (op = 4, flags = 0, count = account targets)
+      item:   [32] hashed_address | u16 slot_count | [2] reserved=0 | slot_count × [32] hashed_slot
+    response: 56 B header (count = storage tries in the answer)
+              | u32 account_nodes | account_nodes × node
+              | count × ( [32] hashed_address | [32] storage_root | u32 nodes | nodes × node )
+      node:   u8 path_len (nibbles, ≤ 64) | ⌈path_len/2⌉ B packed path | u32 rlp_len (≥ 1) | rlp
+    ```
+
+    Paths are packed high nibble first; an odd path's last low nibble is
+    0 (validated). The server sorts account nodes by path, storage tries
+    by hashed address and their nodes by path, so answers are
+    deterministic (a server guarantee, not validated). An empty path is
+    the trie root: keccak(root node) is the block's state root, or the
+    account's `storage_root`. Nodes are untrusted input: consumers verify
+    every node by hash before use (D8). `count = 0` is a ping (no walk, no
+    nodes). Duplicate targets merge.
+  - **Limits**: at most `MAX_ITEMS` (1024) account targets and
+    `MAX_PROOF_SLOTS` (4096) slots per frame, so `MAX_REQUEST_BYTES`
+    becomes `40 + 1024 × 36 + 4096 × 32 = 167 976`. An answer above
+    `MAX_RESPONSE_BYTES` (16 MiB) gets the new frame status **`TooLarge =
+    5`** ("split the request"). It replaces `Internal` for oversized
+    answers of every op.
+  - **Tip pins only.** reth answers a pinned proof by building a revert
+    overlay from its newest persisted state down to the pin, and its cost
+    grows with the distance. Measured on the persisted-state path: a
+    64-account proof takes 6 ms at the frontier, 0.10 s one block back,
+    0.52 s at 16 and 0.79 s at 32 (4.2 s for a first block-sized walk at
+    32). A proof-bench pin left 600 blocks behind took minutes per walk,
+    until MDBX's 5-minute reader limit aborted one. So a pin more than
+    `proof_max_depth` blocks (default 8, about a quarter second) below the
+    source's latest answers `UnknownBlock`. Builders should prove at the
+    head: `LATEST` or the hash the server just read at. Lookups (ops 1–3)
+    keep D9's rule.
+  - **Own threads.** A proof walk takes 0.2 ms to seconds, and a point
+    read tens of µs, so proofs run on a separate pool (`proof_workers`,
+    default 4; queue 64, `Busy` when full). Proofs can never queue ahead
+    of lookups. The per-connection `MAX_INFLIGHT` and output accounting
+    is shared with D9. As in D9, one state provider (one MDBX read
+    transaction) per frame, dropped before the answer is sent.
+  - **Version.** Op 4 and status 5 change the protocol, so `VERSION`
+    goes from 0 to 1 (D9's rule). A v0 peer is refused at the handshake
+    instead of meeting an unknown op or status mid-stream.
+  - The client exposes it as `LookupClient::proof`, which rejects
+    over-cap requests (`TooManyItems`) rather than splitting them, since
+    merging partial proofs is the caller's business. Its own timeout
+    (`proof_timeout`, default 5 s) applies, since a cold block-sized walk
+    takes about a second.
 
 ## 1. Architecture
 
@@ -278,20 +343,21 @@ length + a fixed little-endian body. Byte offsets:
 
 | Request field | Offset | Size | Notes |
 |---|---|---|---|
-| `op` | 0 | 1 | 1 Account, 2 Storage, 3 Code |
+| `op` | 0 | 1 | 1 Account, 2 Storage, 3 Code, 4 Proof (D10) |
 | `flags` | 1 | 1 | bit 0 `INLINE_CODE` (Account only); other bits must be 0 |
 | `count` | 2 | 2 | items; 0 = ping (resolve the pin only) |
 | `id` | 4 | 4 | client-chosen, echoed |
 | `pin_hash` | 8 | 32 | block hash; all zeros = latest |
 | items | 40 | count × 20 / 52 / 32 | `addr` / `addr,slot` / `code_hash` |
+| Proof items | 40 | count × (36 + 32 × slots) | `hashed_address [32], slot_count u16, reserved [2]=0, slots [32]…` |
 
 | Response field | Offset | Size | Notes |
 |---|---|---|---|
 | `op` | 0 | 1 | echoed |
 | `flags` | 1 | 1 | echoed (results are self-describing) |
-| `count` | 2 | 2 | = request count if Ok, else 0 |
+| `count` | 2 | 2 | = request count if Ok (Proof: storage tries), else 0 |
 | `id` | 4 | 4 | echoed |
-| `status` | 8 | 1 | 0 Ok, 1 UnknownBlock, 2 BadRequest, 3 Internal, 4 Busy |
+| `status` | 8 | 1 | 0 Ok, 1 UnknownBlock, 2 BadRequest, 3 Internal, 4 Busy, 5 TooLarge |
 | reserved | 9 | 3 | zero |
 | `server_us` | 12 | 4 | decode → encode, server side |
 | `read_number` | 16 | 8 | block actually read (0 unless Ok) |
@@ -303,8 +369,13 @@ Account `status, nonce u64, balance [32], code_hash [32]` (73 B), plus
 `code_len u32, code` when `INLINE_CODE`; Storage `status, value [32]`
 (33 B); Code `status, len u32, bytes`. "No code" is always `KECCAK_EMPTY`;
 a missing account is `Absent` with zeroed fields; a missing slot is `Ok`
-with zero. Limits: 1024 items (64 for code-carrying ops), 53 288-byte
-requests, 16 MiB responses, 256 requests in flight per connection.
+with zero. Proof (D10) answers have no per-item results: `u32
+account_nodes`, the account nodes, then `count` × (`hashed_address [32],
+storage_root [32], u32 nodes`, the nodes). A node is `path_len u8 (≤ 64
+nibbles), packed path (high nibble first), rlp_len u32 (≥ 1), rlp`. Limits:
+1024 items (64 for code-carrying ops; 4096 slots per Proof frame),
+167 976-byte requests (a full Proof frame), 16 MiB responses
+(`TooLarge` beyond), 256 requests in flight per connection.
 
 ## 3. Milestones
 
@@ -487,6 +558,45 @@ Still open: the same run in-node, once the node runs silt (silt-exex, or
 a node that installs silt-node) — the harness reads at its state
 frontier, not the node's tip.
 
+### M5 — Proofs on the lookup fast path (D10)
+
+- **T5.1** `silt_wire::lookup`: op `Proof = 4` (request items with
+  hashed slots; `ProofBuilder`; validated, allocation-free `ProofRef` /
+  `Nodes` / `Storages` views; `pack_path`), status `TooLarge = 5`,
+  `MAX_PROOF_SLOTS`, `MAX_REQUEST_BYTES = 167 976`, `VERSION` 0 → 1.
+  Tests: proof items in the 10k request round trip, 3k random proof
+  answers, truncation/extension, caps, bad paths/padding/empty nodes,
+  golden bytes, zero-alloc decode.
+- **T5.2** Server: `StateView::proof`, `StateSource::head`, a separate
+  proof pool (`proof_workers` 4, queue 64), `proof_max_depth`
+  (`UnknownBlock` beyond), `TooLarge` for every op; `RethView::proof`
+  over reth's v1 `multiproof` with `write_multiproof` (D10 order). Config
+  `lookup_proof_workers`, `lookup_proof_max_depth`. In-memory tests:
+  answers, pins, ping, depth bound, failures, `TooLarge`; a stuck proof
+  never delays lookups, and the proof queue answers `Busy`.
+- **T5.3** Client: `LookupClient::proof` → `ProofFrame` (zero-copy walk
+  or `to_read()`), caps checked before sending, `proof_timeout` (5 s).
+  Mock-server test.
+- **T5.4** `proof-bench`: op 4 next to `silt_multiproof` and the bare
+  walk on the live datadir, every op-4 answer compared byte for byte with
+  the in-process multiproof, plus a pin-depth sweep. `lookup-verify`:
+  op-4 proofs vs the node's `eth_getProof` at its head.
+
+**Gates:** G5.1 wire tests green. G5.2 server and client tests green;
+`FULL=1 scripts/ci.sh` green. G5.3 every op-4 answer byte-identical to
+reth's multiproof, and every `eth_getProof` node found in op 4 (0
+mismatches). G5.4 numbers in `docs/proof-bench.md`.
+
+**Status (2026-11-13):** T5.1–T5.4 done; G5.1–G5.4 met through the
+read-only harness. proof-bench: 0 of 440 answers differ, 0 root
+failures. lookup-verify: 175 accounts and 120 slots at the head, every
+one of 1549 account-proof and 517 storage-proof nodes present, the root
+matching. Op 4 vs JSON-RPC p50: block-sized 60.2 vs 67.8 ms, 64 accounts
+4.26 vs 5.46 ms, one account 225 vs 288 µs, one slot 309 vs 404 µs; op 4
+adds 36–61 µs to the walk for small proofs. The depth sweep set
+`proof_max_depth` to 8 (D10). As for M4, the in-node run waits for a node
+that installs silt-node.
+
 ## 4. Feature → milestone matrix
 
 | # | Feature | Milestone |
@@ -508,6 +618,9 @@ frontier, not the node's tip.
 | F15 | Lookup client + `LookupFallback` (pipelined, D2 fallback) | M4 |
 | F16 | Read-only harness, lookup bench + verifier vs live datadir | M4 |
 | F17 | `silt-node` library: capabilities installable in any reth node | M4 |
+| F18 | Binary proofs: op 4 layout, codec, `TooLarge`, `VERSION` 1 (D10) | M5 |
+| F19 | Proof pool, depth bound, `LookupClient::proof` | M5 |
+| F20 | Proof bench (byte-exact vs reth) + `eth_getProof` verify | M5 |
 
 ## 5. VERIFY before coding (facts, not assumptions)
 

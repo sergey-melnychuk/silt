@@ -4,7 +4,8 @@
 //! - the **state-diff feed** — an ExEx mapping every committed block into a
 //!   node-agnostic [`silt_wire::BlockDiff`] pushed over TCP ([`feed`], D1/D5/D6);
 //! - the **lookup fast path** — binary, pipelined tip-state reads for cache
-//!   misses on their own listener ([`lookup`], D9), started by the same ExEx;
+//!   misses and trie proofs on their own listener ([`lookup`], D9/D10),
+//!   started by the same ExEx;
 //! - **`silt_multiproof`** — path-directed multiproofs on reth's own RPC
 //!   transports ([`rpc`], D8).
 //!
@@ -77,11 +78,18 @@ where
         let listener = tokio::net::TcpListener::bind(&cfg.lookup_bind).await?;
         let lookup_cfg = lookup::LookupConfig {
             workers: cfg.lookup_workers,
+            proof_workers: cfg.lookup_proof_workers,
+            proof_max_depth: cfg.lookup_proof_max_depth,
             ..Default::default()
         };
         let source = lookup::NodeSource::new(ctx.provider().clone());
         let server = lookup::LookupServer::new(source, chain_id, genesis_hash, lookup_cfg)?;
-        tracing::info!(bind = %cfg.lookup_bind, workers = cfg.lookup_workers, "silt lookup listening");
+        tracing::info!(
+            bind = %cfg.lookup_bind,
+            workers = cfg.lookup_workers,
+            proof_workers = cfg.lookup_proof_workers,
+            "silt lookup listening"
+        );
         tokio::spawn(server.serve(listener));
     }
 
