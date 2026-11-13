@@ -37,6 +37,9 @@ cargo run -p silt-cache --example verify -- 127.0.0.1:8585 http://127.0.0.1:8545
 scripts/soak.sh 24       # log in target/soak/; systemctl --user stop silt-soak
 ```
 
+Operating silt on a node (build, deploy, checks, restarts, rollback,
+upgrades, binding): `docs/runbook.md`.
+
 Lookup fast path (PLAN D9) — binary, pipelined tip-state reads for cache
 misses on their own listener (`lookup_bind`; `""` disables it). Format in
 PLAN §2.1; numbers and the live-datadir verification in

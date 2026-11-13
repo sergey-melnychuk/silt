@@ -1,0 +1,191 @@
+# Operating silt on a reth node (PLAN T3.3)
+
+How to build, deploy, check, roll back and upgrade a reth node that runs
+silt. Written from the first production deployment (a mainnet node,
+November 2026). Gate G3.3: the node's operator reviews this before silt
+first runs against a production node.
+
+## 1. What runs where
+
+silt runs **inside** a reth node; there is no separate silt process.
+
+| Piece | Where | Default | Exposure |
+|---|---|---|---|
+| Diff feed (push, D1) | silt ExEx in the node | `127.0.0.1:8585` (`bind`) | no auth, no TLS |
+| Lookups and proofs (D9/D10) | the node, own threads | `127.0.0.1:8586` (`lookup_bind`) | no auth, no TLS |
+| `silt_multiproof` (D8) | reth's RPC server | wherever `--http`/`--ws`/`--ipc` listen | reth's RPC rules |
+| Consumers (`silt-cache`) | anywhere that can reach the above | — | — |
+
+Two ways to get a node with silt:
+
+- **`silt-exex`** (this repo): stock reth plus silt. Same CLI, same
+  datadir, same flags as the `reth` it replaces.
+- **Any other reth-based node** adds silt-node with two calls on reth's
+  node launcher: `install_exex("silt", |ctx| Ok(silt_node::run_exex(ctx, cfg)))`
+  and, in `extend_rpc_modules`,
+  `ctx.modules.merge_configured(silt_node::rpc_module(ctx.provider().clone()))`
+  (see `crates/silt-node/src/lib.rs`).
+
+silt never writes to the node's database. The ExEx acks each block to
+reth only after the diff is in its in-memory spool (D5), so a slow or dead
+consumer can never hold the node back.
+
+## 2. Configuration (`silt.toml`)
+
+Read from the node's **working directory** at startup. Optional; a
+malformed file stops the node (refusing beats silently ignoring).
+
+```toml
+bind = "127.0.0.1:8585"        # feed
+spool = 128                    # diffs kept for reconnecting consumers (~25 min of blocks)
+heartbeat_secs = 10            # feed heartbeat; consumers reconnect after 30 s of silence
+lookup_bind = "127.0.0.1:8586" # lookups + proofs; "" disables the listener
+lookup_workers = 16            # OS threads for point reads
+lookup_proof_workers = 4       # OS threads for proofs (never queue ahead of reads)
+lookup_proof_max_depth = 8     # proofs pinned deeper below the head answer UnknownBlock
+```
+
+**Binding (D1).** Neither listener authenticates or encrypts.
+- Keep `lookup_bind` on loopback. It serves arbitrary state and proof reads,
+  and a proof can cost the node a second of trie walking.
+- The feed is push-only and read-only. If consumers live on other hosts,
+  bind it to a private interface, or to `0.0.0.0` behind a firewall that
+  admits only the consumers. With `ufw`, for example:
+
+  ```sh
+  ufw allow from 10.0.0.0/24 to any port 8585 proto tcp
+  ufw deny 8585/tcp
+  ```
+
+- **Check before deploying:** `grep bind silt.toml`. A leftover
+  `bind = "0.0.0.0:8585"` on a host with a public interface publishes the
+  feed to the internet.
+
+## 3. Build
+
+The host binary and silt-node must use the **same reth revision**: one
+binary cannot link two reths. silt pins one reth rev in the workspace
+`Cargo.toml` and mirrors that rev's `[patch]` section. A host that depends
+on silt-node pins the same rev.
+
+```sh
+CARGO_BUILD_JOBS=4 cargo build --release -p silt-exex          # stock reth + silt
+# or, in the host repo: cargo build --release -p <host> --bin <node>
+target/release/silt-exex --version                             # reth version + commit
+strings target/release/silt-exex | grep -c "silt feed listening"   # 1: silt is in
+```
+
+A release build of reth needs several GB per job. **Next to a live node**,
+cap it: `CARGO_BUILD_JOBS=4`, one build at a time, ideally inside a
+memory-capped scope. On a 30 GB machine a 16-job build pushed the node into
+systemd-oomd's kill range.
+
+## 4. Deploy (swap the binary)
+
+1. Keep the running binary: `cp bin/node bin/node.prev`.
+2. Copy the new binary in.
+3. Stop the node cleanly with SIGTERM, and wait for the process to exit;
+   reth flushes on shutdown. The consensus client can stay up: it
+   reconnects to the engine API on its own.
+4. Start the node with the same flags, from the directory that holds
+   `silt.toml`.
+
+Downtime is the stop plus the start, a few seconds. The node then catches
+up on the blocks it missed. While it is behind, reth imports in batches,
+and silt publishes **folded spans** (one diff per batch, up to hundreds of
+blocks; one was 415 blocks and 78k accounts). Once the node is at the tip,
+silt is back to one diff per block.
+
+## 5. Check after every start
+
+```sh
+grep -E "silt (feed|lookup) listening" reth.log         # both, at startup
+ss -ltn | grep -E ":(8585|8586) "                       # both listening
+grep "publishing diff" reth.log | tail -3               # span=N..=N, one per block at the tip
+grep -E " ERROR |panicked" reth.log                     # nothing from silt
+```
+
+Then, read-only against the node (reth-free tools from `silt-cache`):
+
+```sh
+target/release/examples/verify 127.0.0.1:8585 http://127.0.0.1:8545 --blocks 20
+target/release/examples/lookup-verify --lookup 127.0.0.1:8586 --rpc http://127.0.0.1:8545
+```
+
+Both must end with `mismatches 0`. `verify` checks every key of every
+diff against `eth_*` pinned at that block; `lookup-verify` checks lookups
+and op-4 proofs against `eth_getProof` at the head.
+
+**Continuity across the restart:** the first diff after the restart should
+start right after the last one the old process published. `start.sh`-style
+scripts that truncate `reth.log` lose the old line, so note the last
+`publishing diff` span before stopping.
+
+## 6. What consumers see when the node restarts
+
+A consumer (`silt-cache`, or `verify`) reconnects with backoff and asks
+for the block after the last one it holds. Then, depending on what the new
+process has spooled (all covered by `crates/silt-cache/tests/restart.rs`):
+
+| Restarted node's spool | Consumer sees | Result |
+|---|---|---|
+| Re-publishes blocks the consumer holds, then newer ones | the blocks after its tip | resumes, no break |
+| A folded span that started below the consumer's tip and runs through it | that span | applied as an overlap, no break |
+| Its first span starts after the consumer's next block | `GapTooOld` | drops to cold, rebuilds lazily |
+| Empty, and the first new block skips ahead | a diff that does not extend its tip | drops to cold |
+
+Cold costs time, not correctness. Reads fall back to the lookup fast path
+or JSON-RPC until the feed has warmed the cache again. A consumer down
+longer than the spool (128 blocks, about 25 minutes) always comes back
+cold.
+
+## 7. Roll back
+
+- **To the previous binary:** swap `bin/node.prev` back in, then stop and
+  start as in §4.
+- **To a node without silt:** start stock reth (same version, same
+  datadir, same flags). silt keeps no state of its own in the datadir;
+  reth keeps its own ExEx notification log there, and a node without the
+  silt ExEx no longer uses it. Consumers lose the feed and the lookup
+  listener. With RPC configured, they keep working through JSON-RPC,
+  slower.
+
+## 8. Upgrade (bump reth)
+
+Order matters, because the host and silt must agree on reth:
+
+1. Bump the host's reth rev.
+2. Bump silt's reth pin to the same rev, re-copy reth's `[patch]` section,
+   and fix any API drift (silt-node is the only crate that sees reth).
+3. Point the host's `silt-node` dependency at the new silt commit.
+
+Gates before deploying:
+- `FULL=1 scripts/ci.sh`;
+- a deploy to a non-critical node, or a short window on the target, with
+  §5's checks;
+- `node-proof-bench` (0 differences, 0 root failures);
+- for a large reth jump, a soak: `scripts/soak.sh 24`.
+
+## 9. Monitoring
+
+- **Node log:** one `silt: publishing diff span=…` line per block. A
+  silence longer than a few blocks while the node imports means the ExEx
+  is stuck: an incident.
+- **Feed heartbeats** carry the height and spool depth every
+  `heartbeat_secs`.
+- **Canary:** run `verify` continuously from the consumer's host
+  (`scripts/soak.sh`). Its hourly `SUMMARY` lines report mismatches,
+  reconnects, gaps, breaks, latency (block timestamp to diff received,
+  about 3 s p50 on mainnet), bytes per block (about 280 KB, about 2 GB a
+  day), and its own memory.
+
+## 10. Known limits
+
+- No auth, no TLS (D1): network placement is the only access control.
+- A reorg means drop-to-cold (D3); consumers rebuild lazily.
+- **First-touch block-sized proofs can be slow:** 0.95 s p50 in the node,
+  one in 20 took 16 s (`docs/proof-bench.md`). The client's default
+  `proof_timeout` is 5 s. Prove warm, in smaller sets, or raise it.
+- Proofs deeper than `lookup_proof_max_depth` (8) below the head answer
+  `UnknownBlock`. Each block of depth costs reth about 25–30 ms of revert
+  overlay.
