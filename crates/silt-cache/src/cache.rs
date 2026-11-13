@@ -128,6 +128,18 @@ impl Cache {
         (cache, events_rx)
     }
 
+    /// A cache over a store the caller feeds itself (`Store::apply`): no
+    /// feed task and no eviction sweep. For consumers that must control
+    /// when a diff lands, e.g. to run block N on state N-1 before applying
+    /// diff N. Misses go to `fallback`, pinned at the store's tip.
+    pub fn from_store(store: Arc<Store>, fallback: Arc<dyn Fallback>) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            fallback,
+            flights: DashMap::new(),
+        })
+    }
+
     pub fn tip(&self) -> Option<(u64, Word)> {
         self.store.tip()
     }

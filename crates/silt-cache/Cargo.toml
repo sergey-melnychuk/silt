@@ -23,5 +23,9 @@ async-trait.workspace = true
 tiny-keccak = { version = "2", features = ["keccak"] }
 yevm = { workspace = true, optional = true }
 
+[[example]]
+name = "replay"
+required-features = ["yevm"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "time", "test-util"] }

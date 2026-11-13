@@ -166,7 +166,12 @@ ChainSpec>`); the lookup server only needs the node's provider.
   `GapTooOld` by a span's end rather than its start, and the client now
   applies an overlapping span (`client::continuity`) instead of dropping
   to cold.
-- Pending (PLAN M2/M3 gates): yevm `Executor::run` replay smoke, wrapper
+- M2 replay check (yevm adapter): `replay` (silt-cache example, feature
+  `yevm`) runs each new block's transactions through yevm's `Executor` on
+  a `Cache` that holds the parent state (`Cache::from_store`: the tool
+  feeds the store itself and applies diff N only after block N ran), and
+  compares status, gas and created address with the node's receipts.
+- Pending live runs (PLAN M2/M3 gates): the replay check, the wrapper
   kill/catch-up test under load, and the 24 h live-node equivalence soak.
 
 Feed and lookup security model (PLAN D1): no auth/TLS — bind to localhost
