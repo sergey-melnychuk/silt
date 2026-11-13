@@ -171,7 +171,14 @@ ChainSpec>`); the lookup server only needs the node's provider.
   a `Cache` that holds the parent state (`Cache::from_store`: the tool
   feeds the store itself and applies diff N only after block N ran), and
   compares status, gas and created address with the node's receipts.
-- Pending live runs (PLAN M2/M3 gates): the replay check, the wrapper
+- D11 warm state trie (silt-cache feature `trie`): `WarmTrie` follows the
+  diffs, recomputes the state root per block and fetches only unseen nodes
+  over op 4 (a batch per diff plus path-directed probes); offline tests
+  check every root against full tries over 40 random blocks, with and
+  without pruning. `trie-follow` checks it against live headers.
+- D6 cap: catch-up segments longer than `max_span` (default 32) blocks are
+  published as several diffs, each with only its own blocks' keys.
+- Pending live runs (PLAN M2/M3 gates): the replay check, `trie-follow`, the wrapper
   kill/catch-up test under load, and the 24 h live-node equivalence soak.
 
 Feed and lookup security model (PLAN D1): no auth/TLS — bind to localhost

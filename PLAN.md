@@ -46,6 +46,15 @@ yevm's trait. The core crate has **no yevm dependency**.
   diff (`span_start..number`, last-write-wins); per-block `HeadLite` and
   receipts ride inside the frame so historical heads/receipts survive the
   fold.
+  **Amended (2026-11-13): capped at `max_span` blocks (default 32).** A
+  node catching up after a restart hands over hundreds of blocks per
+  notification; one fold of 415 blocks was 78k accounts in one frame.
+  Longer segments split into diffs of at most `max_span` blocks, each
+  carrying only the keys its own blocks touched (the bundle's per-block
+  reverts) with values at its last block (the bundle reverted to it).
+  Applied in order they equal the whole fold. If the reverts don't name
+  every changed account, the segment folds whole as before. `0` turns
+  the cap off.
 - **D7 — The wrapper is a thin pin, not a fork:** stock reth node builder
   + `install_exex`, same CLI/datadir as stock reth; target ≤200 LoC for
   main + glue. Upgrading reth = bump the pin, fix compile, rerun gates.
@@ -280,6 +289,27 @@ yevm's trait. The core crate has **no yevm dependency**.
     merging partial proofs is the caller's business. Its own timeout
     (`proof_timeout`, default 5 s) applies, since a cold block-sized walk
     takes about a second.
+- **D11 — A warm partial state trie, fed by the feed (silt-cache,
+  feature `trie`).** A consumer that checks or computes state roots needs
+  trie nodes. Proving every changed key per block costs a block-sized
+  proof (57 ms warm, about 1 s cold in the node, `docs/proof-bench.md`).
+  `WarmTrie` keeps the partial account trie, and the storage tries of the
+  accounts it touched, across blocks. It applies each diff and
+  recomputes the root, fetching only nodes it has never seen:
+  - one batched op-4 request per diff, for the keys whose paths end in a
+    stub, pinned at the trie's block;
+  - path-directed probes for any stub an update still needs, such as the
+    sibling a deletion's collapse merges with (a key padded from the
+    stub's nibble path, D8).
+
+  The trie is mpt-lab's `mpt-core` partial MPT (byte-exact, verified
+  against mainnet there). Every node is hash-checked against its parent's
+  reference before use. Revealed nodes are capped (`max_nodes`): past the
+  cap, subtrees below `keep_depth` nibbles become stubs again, except
+  nodes under 32 bytes, which their parent inlines. Storage tries
+  untouched for `storage_ttl` blocks are dropped. A fetch that fails
+  mid-update drops the trie to cold; the consumer reseeds it from a
+  header's state root. reth-free: CI checks that `trie` pulls no reth.
 
 ## 1. Architecture
 

@@ -19,6 +19,9 @@ pub mod store;
 #[cfg(feature = "yevm")]
 pub mod adapter;
 
+#[cfg(feature = "trie")]
+pub mod trie;
+
 use std::sync::Arc;
 
 pub use cache::{Cache, CacheConfig};

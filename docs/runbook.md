@@ -43,6 +43,7 @@ lookup_bind = "127.0.0.1:8586" # lookups + proofs; "" disables the listener
 lookup_workers = 16            # OS threads for point reads
 lookup_proof_workers = 4       # OS threads for proofs (never queue ahead of reads)
 lookup_proof_max_depth = 8     # proofs pinned deeper below the head answer UnknownBlock
+max_span = 32                  # most blocks per diff while catching up; 0 = one diff per segment
 ```
 
 **Binding (D1).** Neither listener authenticates or encrypts.
@@ -92,9 +93,10 @@ systemd-oomd's kill range.
 
 Downtime is the stop plus the start, a few seconds. The node then catches
 up on the blocks it missed. While it is behind, reth imports in batches,
-and silt publishes **folded spans** (one diff per batch, up to hundreds of
-blocks; one was 415 blocks and 78k accounts). Once the node is at the tip,
-silt is back to one diff per block.
+and silt publishes **folded spans** of at most `max_span` blocks (32 by
+default; before the cap, one catch-up span was 415 blocks and 78k
+accounts in one frame). Once the node is at the tip, silt is back to one
+diff per block.
 
 ## 5. Check after every start
 

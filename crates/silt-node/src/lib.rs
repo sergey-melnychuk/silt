@@ -121,12 +121,15 @@ where
         }
 
         if let Some(chain) = notification.committed_chain() {
-            let diff = mapping::diff_from_chain(&chain)?;
-            let duplicate =
-                matches!(last_published, Some((n, h)) if diff.number <= n && diff.hash == h);
-            if duplicate {
-                tracing::info!(number = diff.number, "silt: skipping re-delivered diff");
-            } else {
+            // Long catch-up segments come out as several diffs of at most
+            // `max_span` blocks; all are spooled before the ack.
+            for diff in mapping::diffs_from_chain(&chain, cfg.max_span)? {
+                let duplicate =
+                    matches!(last_published, Some((n, h)) if diff.number <= n && diff.hash == h);
+                if duplicate {
+                    tracing::info!(number = diff.number, "silt: skipping re-delivered diff");
+                    continue;
+                }
                 tracing::info!(
                     span = ?(diff.span_start..=diff.number),
                     accounts = diff.accounts.len(),
@@ -136,7 +139,7 @@ where
                 publisher.publish_diff(&diff).await?;
                 last_published = Some((diff.number, diff.hash));
             }
-            // D5: the frame is spooled — safe to let reth prune.
+            // D5: the frames are spooled — safe to let reth prune.
             ctx.events
                 .send(ExExEvent::FinishedHeight(chain.tip().num_hash()))?;
         }

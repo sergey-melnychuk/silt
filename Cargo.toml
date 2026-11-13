@@ -38,6 +38,10 @@ toml = "0.9"
 
 # Adapter: yevm only behind silt-cache's optional `yevm` feature.
 yevm = { git = "https://github.com/sergey-melnychuk/yevm.git", branch = "main" }
+# Warm partial state trie (D11): mpt-lab's byte-exact partial MPT, only
+# behind silt-cache's optional `trie` feature. reth-free (rlp + sha3).
+mpt-core = { git = "https://github.com/sergey-melnychuk/mpt-lab.git", rev = "e742acc96cc29d5b60f3fd51cbc86eb2a5b969fc" }
+rlp = "0.6"
 
 # Mirrors the `[patch]` section of reth 46731e9's root Cargo.toml (same as
 # yevm's root Cargo.toml): Cargo ignores a dependency's patches, and without

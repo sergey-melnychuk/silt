@@ -24,6 +24,11 @@ pub struct SiltConfig {
     /// Pinned proofs deeper than this below the head answer `UnknownBlock`
     /// (reth's revert overlay grows with the distance, D10).
     pub lookup_proof_max_depth: u64,
+    /// Most blocks one diff may cover. A node catching up imports hundreds
+    /// of blocks per notification; longer segments are split into diffs of
+    /// at most this many blocks, each with only its own keys. 0 = no cap
+    /// (one diff per segment, D6).
+    pub max_span: u64,
 }
 
 impl Default for SiltConfig {
@@ -36,6 +41,7 @@ impl Default for SiltConfig {
             lookup_workers: 16,
             lookup_proof_workers: 4,
             lookup_proof_max_depth: 8,
+            max_span: 32,
         }
     }
 }
@@ -66,6 +72,9 @@ mod tests {
             (cfg.lookup_proof_workers, cfg.lookup_proof_max_depth),
             (4, 8)
         );
+        assert_eq!(cfg.max_span, 32);
+        let off: SiltConfig = toml::from_str("max_span = 0").unwrap();
+        assert_eq!(off.max_span, 0);
     }
 
     #[test]

@@ -9,6 +9,8 @@ default = []
 # Optional compatibility adapter: yevm Chain impl + overlay() helper.
 # Core crate must keep compiling without it (PLAN D4).
 yevm = ["dep:yevm"]
+# Warm partial state trie fed by the diff stream (PLAN D11); reth-free.
+trie = ["dep:mpt-core", "dep:rlp"]
 
 [dependencies]
 silt-wire.workspace = true
@@ -22,10 +24,16 @@ serde_json.workspace = true
 async-trait.workspace = true
 tiny-keccak = { version = "2", features = ["keccak"] }
 yevm = { workspace = true, optional = true }
+mpt-core = { workspace = true, optional = true }
+rlp = { workspace = true, optional = true }
 
 [[example]]
 name = "replay"
 required-features = ["yevm"]
+
+[[example]]
+name = "trie-follow"
+required-features = ["trie"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "time", "test-util"] }

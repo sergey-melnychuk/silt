@@ -8,8 +8,10 @@ cd "$(dirname "$0")/.."
 cargo fmt --all -- --check
 cargo clippy -p silt-wire -p silt-cache --all-targets -- -D warnings
 cargo clippy -p silt-cache --features yevm --all-targets -- -D warnings
+cargo clippy -p silt-cache --features trie --all-targets -- -D warnings
 cargo test -p silt-wire -p silt-cache
 cargo test -p silt-cache --features yevm
+cargo test -p silt-cache --features trie
 
 # D4 dependency boundaries:
 # - wire: no reth, no yevm, ever.
@@ -23,6 +25,11 @@ fi
 # - cache (+yevm): yevm allowed, reth still forbidden.
 if cargo tree -p silt-cache --features yevm --prefix none | awk '{print $1}' | grep -qiE '^reth'; then
   echo "FAIL: silt-cache (+yevm) grew a reth dependency"; exit 1
+fi
+
+# - cache (+trie): mpt-core allowed, reth still forbidden.
+if cargo tree -p silt-cache --features trie --prefix none | awk '{print $1}' | grep -qiE '^reth'; then
+  echo "FAIL: silt-cache (+trie) grew a reth dependency"; exit 1
 fi
 
 # - reth lives only in silt-node (the library) and silt-exex (its host binary).
