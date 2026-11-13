@@ -8,12 +8,12 @@
 //!                [--old-offset 5000]
 //!
 //! `--pin latest` (default) reads at the server's tip on every request —
-//! the path a builder pinned to its cache head takes in the ExEx. `--pin
+//! the path a cache pinned to its head takes in the ExEx. `--pin
 //! fixed` pins every request to the hash the server called latest at start;
 //! once the tip moves past it, that is a read *behind* the tip (through
 //! reth's history path in the read-only harness). Two key pools:
 //! - `recent`: keys touched by the newest blocks (senders, recipients, log
-//!   emitters, access-list slots) — what a builder misses on;
+//!   emitters, access-list slots) — what a tip-state cache misses on;
 //! - `old`: the same kinds of keys from blocks `--old-offset` back — likely cold in
 //!   the OS page cache (the page cache is shared with the live node and is
 //!   not dropped; `--server-pid` reports the server's major page faults per

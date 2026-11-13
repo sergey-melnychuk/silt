@@ -72,7 +72,7 @@ yevm's trait. The core crate has **no yevm dependency**.
   blocks resolve through reth's revert overlay and get costlier with
   distance from tip, same constraint as `eth_getProof`.
 - **D9 — Cache misses take a binary lookup fast path, on its own
-  socket.** A builder reads state only at the tip; the feed keeps its
+  socket.** A consumer reads state only at the tip; the feed keeps its
   cache current, so only misses leave the process, and each one used to
   pay HTTP + JSON + hex per key. The ExEx serves a request/response
   lookup protocol on a **separate listener** (`lookup_bind`, default
@@ -154,7 +154,7 @@ yevm's trait. The core crate has **no yevm dependency**.
     `InsufficientChangesets`) or not-yet-readable hashes answer
     `UnknownBlock` — never stale data. Every `Ok` response names the
     `(read_number, read_hash)` it read at; all items in one frame come
-    from one state view at that block. A builder pins to its cache head;
+    from one state view at that block. A consumer pins to its cache head;
     when reth is a block ahead, the read goes through reth's in-memory
     overlay one block back — expected. A pin that loses canonicality
     mid-request may still return that block's post-state; the consumer's
@@ -218,12 +218,12 @@ yevm's trait. The core crate has **no yevm dependency**.
     `StateSource` trait in `silt-node/src/lookup.rs`, so the server code
     is shared and testable without reth.
 - **D10 — Proofs take the binary fast path too: op `Proof = 4` on the D9
-  listener.** With D9, a builder's state reads no longer need reth's
+  listener.** With D9, a consumer's state reads no longer need reth's
   database; the last reads that did were trie nodes for its state root.
   `silt_multiproof` (D8) answers them, but as JSON-RPC: hex doubles the
   bytes, and encoding, HTTP and parsing cost 17% of a block-sized proof
   and 30–52% of a single-account or single-slot fetch
-  (`docs/proof-bench.md`). Those small fetches are what a builder whose
+  (`docs/proof-bench.md`). Those small fetches are what a consumer whose
   sparse trie is kept warm by the feed sends: it reveals only the nodes
   it hasn't seen. Op 4 carries exactly D8's read (pre-hashed,
   path-directed targets; reth's `StateProofProvider::multiproof`; the
@@ -263,7 +263,7 @@ yevm's trait. The core crate has **no yevm dependency**.
     32). A proof-bench pin left 600 blocks behind took minutes per walk,
     until MDBX's 5-minute reader limit aborted one. So a pin more than
     `proof_max_depth` blocks (default 8, about a quarter second) below the
-    source's latest answers `UnknownBlock`. Builders should prove at the
+    source's latest answers `UnknownBlock`. Clients should prove at the
     head: `LATEST` or the hash the server just read at. Lookups (ops 1–3)
     keep D9's rule.
   - **Own threads.** A proof walk takes 0.2 ms to seconds, and a point

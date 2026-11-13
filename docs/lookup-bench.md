@@ -19,7 +19,7 @@ stall cold reads), so absolute numbers carry that noise.
   touched by earlier runs, so cold in the OS page cache, which is shared
   with the live node and was **not** dropped).
 - **Pin**: `latest` — every request reads at the server's tip, the path a
-  builder pinned to its cache head takes. A `--pin fixed` run is below.
+  cache pinned to its head takes. A `--pin fixed` run is below.
 - **Modes**, each on its own disjoint slice of a pool, run twice: *first
   touch*, then *warm* (same keys again). Singles ask exactly what
   `LookupFallback` asks (`Account` + inline code, or one `Storage`);

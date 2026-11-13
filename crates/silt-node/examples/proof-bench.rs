@@ -4,7 +4,7 @@
 //! answers exactly what reth's multiproof says.
 //!
 //! Opens a live datadir read-only (`common/ro.rs`) and, per request,
-//! re-pins to the **current** state frontier (untimed) — a builder proves
+//! re-pins to the **current** state frontier (untimed) — a client proves
 //! at the tip; a fixed pin falls behind a live node and every walk then
 //! rebuilds a revert overlay that grows with the distance (minutes after a
 //! couple of hours) — and measures:

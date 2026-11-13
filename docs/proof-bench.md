@@ -11,7 +11,7 @@ and it led to D10. The current bench measures the real op 4.
 `crates/silt-node/examples/proof-bench.rs` opens the live node's datadir
 read-only (reth `46731e9`, mainnet, the same harness as `lookup-ro`).
 Before each request it re-pins to the current state frontier, untimed: a
-builder proves at the tip. It runs every request three ways:
+client proves at the tip. It runs every request three ways:
 
 - **walk**: `StateProofProvider::multiproof` in-process, the floor for
   any transport;
@@ -74,7 +74,7 @@ costs 6 ms at the frontier and 0.79 s 32 blocks back. The server default
 (interpolated between the measured 4 and 16), instead of the 32 first
 written into D10. This is the read-only, persisted-state path; a node
 serving pins inside its in-memory canonical blocks may be cheaper (not
-measured yet). Either way, builders should prove at the head.
+measured yet). Either way, clients should prove at the head.
 
 ### Verification against the node (`lookup-verify`)
 
@@ -106,7 +106,7 @@ bench measures op 4 itself (above).
 `crates/silt-node/examples/proof-bench.rs` opens the live node's datadir
 read-only (reth `46731e9`, mainnet, the same harness as `lookup-ro`).
 Before each request it re-pins to the current state frontier, untimed: a
-builder always proves at the tip. Per request it measures:
+client always proves at the tip. Per request it measures:
 
 - **walk**: opening a state provider plus `StateProofProvider::multiproof`,
   in-process. Every transport pays this.
@@ -164,7 +164,7 @@ the server's own walks run on other threads in between.
   30% of a single-account fetch (about 0.13 ms) and 52% of a single-slot
   fetch (about 0.25 ms). A binary op would bring those to walk plus about
   20–45 µs, roughly a 1.2–2x saving per small fetch.
-- **The bigger lever is not walking at all.** A builder that keeps its
+- **The bigger lever is not walking at all.** A client that keeps its
   sparse trie warm from the diff feed (D1) only fetches nodes it hasn't
   revealed yet (D8's path-directed probes). Those are exactly the small
   requests where the binary op saves the most, and batching a block's
