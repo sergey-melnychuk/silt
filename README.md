@@ -31,6 +31,10 @@ cargo build --release -p silt-exex          # the node wrapper (compiles reth)
 
 # watch + verify the feed against RPC (checks every applied key, pinned):
 cargo run -p silt-cache --example verify -- 127.0.0.1:8585 http://127.0.0.1:8545
+
+# 24 h soak (PLAN T3.2): the same verifier in a memory-capped user unit,
+# with latency/bytes/apply/RSS summaries hourly and a final report:
+scripts/soak.sh 24       # log in target/soak/; systemctl --user stop silt-soak
 ```
 
 Lookup fast path (PLAN D9) — binary, pipelined tip-state reads for cache
@@ -144,6 +148,12 @@ ChainSpec>`); the lookup server only needs the node's provider.
   answer byte-identical to reth's multiproof, every `eth_getProof` node
   present (`docs/proof-bench.md`). In the node, all 440 op-4 answers equal
   `silt_multiproof` at the same block (`node-proof-bench`).
+- M3 soak tooling: `verify` applies every diff to a silt-cache `Store`
+  (with eviction), checks every applied key, code hash and destroyed
+  account against pinned RPC, reconnects through the spool, and reports
+  latency, frame bytes, apply time and RSS (`scripts/soak.sh`). A 10-block
+  smoke run: 12,510 keys, 0 mismatches, diff received p50 2.8 s after the
+  block's timestamp, ~280 KB per block.
 - Pending (PLAN M2/M3 gates): yevm `Executor::run` replay smoke, wrapper
   kill/catch-up test under load, and the 24 h live-node equivalence soak.
 
