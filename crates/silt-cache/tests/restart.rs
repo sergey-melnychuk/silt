@@ -140,7 +140,7 @@ impl Feed {
         let tip = self.spool.lock().await.back().map_or(0, |(_, n, _)| *n);
         write_frame(&mut s, &silt_wire::hello(1, GENESIS, tip)).await?;
         let _hello = read_frame(&mut s).await?;
-        let Some(Frame::Subscribe { from }) = read_frame(&mut s).await? else {
+        let Some(Frame::Subscribe { from, .. }) = read_frame(&mut s).await? else {
             eyre::bail!("expected Subscribe");
         };
         let mut rx = self.tx.subscribe();
@@ -275,6 +275,9 @@ async fn drain(events: &mut UnboundedReceiver<HeadEvent>, until: u64) -> (Vec<u6
         match tokio::time::timeout_at(deadline, events.recv()).await {
             Ok(Some(HeadEvent::NewHead(h))) => heads.push(h.number),
             Ok(Some(HeadEvent::ChainBreak { .. })) => breaks += 1,
+            Ok(Some(HeadEvent::Reorg { fork_number, .. })) => {
+                panic!("no reorg in these tests, got one to {fork_number}")
+            }
             Ok(None) | Err(_) => panic!("stalled at {heads:?} (breaks {breaks})"),
         }
     }

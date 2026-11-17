@@ -34,10 +34,18 @@ pub use silt_wire::{Addr, HeadLite, Word};
 #[derive(Clone, Debug)]
 pub enum HeadEvent {
     NewHead(HeadLite),
-    /// The carry was dropped (reorg, gap, feed anomaly) — state rebuilds
-    /// lazily; in-flight work pinned to pre-break heads should be cancelled.
+    /// The carry was dropped (gap, feed anomaly, or a reorg it could not
+    /// roll back) — state rebuilds lazily; in-flight work pinned to
+    /// pre-break heads should be cancelled.
     ChainBreak {
         reason: String,
+    },
+    /// A reorg was rolled back (PLAN D12): the cache is coherent at the
+    /// fork block now and follows the new side from there. Work pinned to
+    /// heads above the fork should be cancelled.
+    Reorg {
+        fork_number: u64,
+        fork_hash: silt_wire::Word,
     },
 }
 

@@ -14,8 +14,9 @@ pub mod lookup;
 
 pub const MAGIC: [u8; 4] = *b"SILT";
 /// Covers the feed and the lookup protocol (PLAN D9): `0` at D9, `1` since
-/// D10 added op `Proof` and status `TooLarge`.
-pub const VERSION: u16 = 1;
+/// D10 added op `Proof` and status `TooLarge`, `2` since D12 changed
+/// `Subscribe` and `Reorg`.
+pub const VERSION: u16 = 2;
 /// Upper bound on a single frame; a mainnet block diff is ~100-400 KB, so
 /// this is generous headroom while still rejecting garbage lengths.
 pub const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
@@ -104,16 +105,20 @@ pub enum Frame {
     Refused {
         reason: String,
     },
-    /// Client -> server. `None` = from the current tip.
+    /// Client -> server. `from: None` = from the current tip.
+    /// `parent_hash` is the hash of block `from - 1` (the client's tip): a
+    /// tip that a reorg dropped is answered with `Reorg` first (PLAN D12).
     Subscribe {
         from: Option<u64>,
+        parent_hash: Option<Word>,
     },
     Diff(BlockDiff),
-    /// Chain reorganized; the new side's `Diff` (parent below the fork)
-    /// follows. Consumers drop to cold on sight (PLAN D3).
+    /// Everything above `fork_number` was replaced (or reverted); the new
+    /// side's diffs follow from `fork_number + 1`. Consumers roll back to
+    /// the fork, or drop to cold if they can't (PLAN D12).
     Reorg {
-        new_tip_number: u64,
-        new_tip_hash: Word,
+        fork_number: u64,
+        fork_hash: Word,
     },
     Heartbeat {
         height: u64,
@@ -312,11 +317,12 @@ mod tests {
                 0 => hello(rng.next(), rng.word(), rng.next()),
                 1 => Frame::Subscribe {
                     from: (i.is_multiple_of(2)).then(|| rng.next()),
+                    parent_hash: (i.is_multiple_of(4)).then(|| rng.word()),
                 },
                 2 => Frame::Diff(random_diff(&mut rng)),
                 3 => Frame::Reorg {
-                    new_tip_number: rng.next(),
-                    new_tip_hash: rng.word(),
+                    fork_number: rng.next(),
+                    fork_hash: rng.word(),
                 },
                 4 => Frame::Heartbeat {
                     height: rng.next(),
@@ -401,9 +407,13 @@ mod tests {
         assert!(hello_mismatch(&ours, &hello(1, [7; 32], 99)).is_none()); // tip may differ
         assert!(hello_mismatch(&ours, &hello(2, [7; 32], 10)).is_some());
         assert!(hello_mismatch(&ours, &hello(1, [8; 32], 10)).is_some());
-        assert!(hello_mismatch(&ours, &Frame::Subscribe { from: None }).is_some());
-        // Any other version is refused, including v0 (D9) since D10.
-        for version in [VERSION + 1, 0] {
+        let subscribe = Frame::Subscribe {
+            from: None,
+            parent_hash: None,
+        };
+        assert!(hello_mismatch(&ours, &subscribe).is_some());
+        // Any other version is refused: v0 (D9) since D10, v1 since D12.
+        for version in [VERSION + 1, 1, 0] {
             let bad_version = Frame::Hello {
                 magic: MAGIC,
                 version,

@@ -112,10 +112,29 @@ where
     let mut last_published: Option<(u64, silt_wire::Word)> = None;
 
     while let Some(notification) = ctx.notifications.try_next().await? {
-        if let ExExNotification::ChainReorged { old, new } = &notification {
-            tracing::warn!(from = ?old.range(), to = ?new.range(), "silt: reorg");
+        // D12: consumers roll back to the fork; the new side (if any)
+        // follows as ordinary diffs.
+        let replaced = match &notification {
+            ExExNotification::ChainReorged { old, new } => {
+                tracing::warn!(from = ?old.range(), to = ?new.range(), "silt: reorg");
+                Some((old, new.fork_block()))
+            }
+            ExExNotification::ChainReverted { old } => {
+                tracing::warn!(range = ?old.range(), "silt: revert");
+                Some((old, old.fork_block()))
+            }
+            ExExNotification::ChainCommitted { .. } => None,
+        };
+        if let Some((old, fork)) = replaced {
+            let dropped: Vec<(u64, silt_wire::Word)> = old
+                .headers()
+                .map(|h| {
+                    let nh = h.num_hash();
+                    (nh.number, nh.hash.0)
+                })
+                .collect();
             publisher
-                .publish_reorg(new.tip().header().number, new.tip().hash().0)
+                .publish_reorg((fork.number, fork.hash.0), &dropped)
                 .await?;
             last_published = None; // the new side must always publish
         }

@@ -1,10 +1,13 @@
 //! Feed client: connect, validate, apply, emit head events (PLAN T2.1/T2.5).
 //!
 //! Generic over the stream so tests drive it with `tokio::io::duplex`.
-//! Drop-to-cold is the only reorg/gap behavior (D3): any chain break clears
-//! the store, emits `ChainBreak`, and keeps consuming (the next diff seeds
-//! a fresh carry — with `Subscribe{None}` semantics the first diff is
-//! accepted without a parent check because the store is empty).
+//! A `Reorg` frame rolls the store back to the fork and emits `Reorg`
+//! (PLAN D12); the new side then arrives as ordinary diffs. Any other chain
+//! break, and a reorg the store can't roll back, drops to cold (D3): the
+//! store is cleared, `ChainBreak` is emitted, and consuming continues (the
+//! next diff seeds a fresh carry — with `Subscribe{None}` semantics the
+//! first diff is accepted without a parent check because the store is
+//! empty).
 //!
 //! A node restart is not a break: the new process doesn't know what the old
 //! one published, so reth's replay can re-deliver a diff the client already
@@ -136,8 +139,14 @@ pub async fn run_stream<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     write_frame(&mut stream, &silt_wire::hello(chain_id, genesis_hash, 0)).await?;
-    let from = state.store.tip().map(|(n, _)| n + 1);
-    write_frame(&mut stream, &Frame::Subscribe { from }).await?;
+    // Our tip's hash lets the server spot a tip a reorg dropped while we
+    // were away and send the fork to roll back to first (D12).
+    let tip = state.store.tip();
+    let subscribe = Frame::Subscribe {
+        from: tip.map(|(n, _)| n + 1),
+        parent_hash: tip.map(|(_, h)| h),
+    };
+    write_frame(&mut stream, &subscribe).await?;
 
     loop {
         let frame = tokio::time::timeout(liveness, read_frame(&mut stream)).await;
@@ -172,8 +181,22 @@ pub async fn run_stream<S: AsyncRead + AsyncWrite + Unpin>(
                     let _ = state.events.send(HeadEvent::NewHead(head));
                 }
             }
-            Frame::Reorg { new_tip_number, .. } => {
-                state.cold(&format!("reorg to {new_tip_number}"));
+            Frame::Reorg {
+                fork_number,
+                fork_hash,
+            } => {
+                let tip = state.store.tip().map_or(0, |(n, _)| n);
+                if state.store.rollback(fork_number, fork_hash) {
+                    tracing::warn!(tip, fork_number, "silt-cache: reorg rolled back");
+                    let _ = state.events.send(HeadEvent::Reorg {
+                        fork_number,
+                        fork_hash,
+                    });
+                } else {
+                    state.cold(&format!(
+                        "reorg to fork {fork_number} from tip {tip}: can't roll back"
+                    ));
+                }
             }
             Frame::GapTooOld { oldest_available } => {
                 state.cold(&format!("gap: spool starts at {oldest_available}"));
@@ -268,7 +291,10 @@ mod tests {
             let sub = read_frame(&mut server_io).await.unwrap().unwrap();
             assert_eq!(
                 sub,
-                Frame::Subscribe { from: None },
+                Frame::Subscribe {
+                    from: None,
+                    parent_hash: None
+                },
                 "cold store subscribes from tip"
             );
 
@@ -338,7 +364,13 @@ mod tests {
                 .unwrap();
             let _ = read_frame(&mut server_io).await.unwrap().unwrap();
             let sub = read_frame(&mut server_io).await.unwrap().unwrap();
-            assert_eq!(sub, Frame::Subscribe { from: Some(8) });
+            assert_eq!(
+                sub,
+                Frame::Subscribe {
+                    from: Some(8),
+                    parent_hash: Some([7; 32])
+                }
+            );
             drop(server_io);
         });
         let _ = run_stream(client_io, &state, Duration::from_secs(5)).await;
@@ -447,7 +479,13 @@ mod tests {
                 .unwrap();
             let _ = read_frame(&mut server_io).await.unwrap().unwrap();
             let sub = read_frame(&mut server_io).await.unwrap().unwrap();
-            assert_eq!(sub, Frame::Subscribe { from: Some(9) });
+            assert_eq!(
+                sub,
+                Frame::Subscribe {
+                    from: Some(9),
+                    parent_hash: Some([8; 32])
+                }
+            );
             for frame in [folded(6, 8, None), folded(6, 11, None), diff(12, 12, 11)] {
                 write_frame(&mut server_io, &Frame::Diff(frame))
                     .await
@@ -472,6 +510,119 @@ mod tests {
             .filter_map(|n| store.head(n).map(|h| h.number))
             .collect();
         assert_eq!(heads, (5..=12).collect::<Vec<_>>());
+    }
+
+    /// D12: a one-block reorg rolls back to the fork (state of the
+    /// dropped block undone, the rest kept), then the replacement applies;
+    /// a reorg deeper than the journal drops to cold.
+    #[tokio::test]
+    async fn a_reorg_rolls_back_and_follows_the_new_side() {
+        let (client_io, mut server_io) = tokio::io::duplex(1 << 16);
+        let (tx, mut rx) = unbounded_channel();
+        let state = ClientState {
+            store: Arc::new(Store::with_reorg_depth(16, 3)),
+            events: tx,
+            identity: std::sync::Mutex::new(None),
+        };
+        tokio::spawn(async move {
+            write_frame(&mut server_io, &silt_wire::hello(1, [9; 32], 12))
+                .await
+                .unwrap();
+            let _ = read_frame(&mut server_io).await.unwrap().unwrap();
+            let _ = read_frame(&mut server_io).await.unwrap().unwrap();
+            let mut replacement = diff(12, 0x8c, 11);
+            replacement.accounts[0].0 = [0x8c; 20];
+            let frames = [
+                Frame::Diff(diff(10, 10, 9)),
+                Frame::Diff(diff(11, 11, 10)),
+                Frame::Diff(diff(12, 12, 11)),
+                Frame::Reorg {
+                    fork_number: 11,
+                    fork_hash: [11; 32],
+                },
+                Frame::Diff(replacement),
+                Frame::Diff(diff(13, 13, 0x8c)),
+                Frame::Diff(diff(14, 14, 13)),
+                Frame::Diff(diff(15, 15, 14)),
+                // Four blocks above the fork, journal of three: cold.
+                Frame::Reorg {
+                    fork_number: 11,
+                    fork_hash: [11; 32],
+                },
+            ];
+            for frame in frames {
+                write_frame(&mut server_io, &frame).await.unwrap();
+            }
+        });
+        let store = state.store.clone();
+        let _ = run_stream(client_io, &state, Duration::from_secs(5)).await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(match e {
+                HeadEvent::NewHead(h) => format!("head {}", h.number),
+                HeadEvent::Reorg { fork_number, .. } => format!("reorg {fork_number}"),
+                HeadEvent::ChainBreak { .. } => "break".to_string(),
+            });
+        }
+        assert_eq!(
+            events,
+            [
+                "head 10", "head 11", "head 12", "reorg 11", "head 12", "head 13", "head 14",
+                "head 15", "break"
+            ]
+        );
+        assert_eq!(
+            store
+                .stats
+                .rollbacks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// The rolled-back store holds what it held at the fork: the dropped
+    /// block's account is gone, older ones stay, the new side's is there.
+    #[tokio::test]
+    async fn a_rolled_back_store_keeps_its_pre_fork_state() {
+        let (client_io, mut server_io) = tokio::io::duplex(1 << 16);
+        let (tx, _rx) = unbounded_channel();
+        let state = ClientState {
+            store: Arc::new(Store::new(16)),
+            events: tx,
+            identity: std::sync::Mutex::new(None),
+        };
+        tokio::spawn(async move {
+            write_frame(&mut server_io, &silt_wire::hello(1, [9; 32], 12))
+                .await
+                .unwrap();
+            let _ = read_frame(&mut server_io).await.unwrap().unwrap();
+            let _ = read_frame(&mut server_io).await.unwrap().unwrap();
+            let mut replacement = diff(12, 0x8c, 11);
+            replacement.accounts[0].0 = [0x8c; 20];
+            for frame in [
+                Frame::Diff(diff(10, 10, 9)),
+                Frame::Diff(diff(11, 11, 10)),
+                Frame::Diff(diff(12, 12, 11)),
+                Frame::Reorg {
+                    fork_number: 11,
+                    fork_hash: [11; 32],
+                },
+                Frame::Diff(replacement),
+            ] {
+                write_frame(&mut server_io, &frame).await.unwrap();
+            }
+        });
+        let store = state.store.clone();
+        let _ = run_stream(client_io, &state, Duration::from_secs(5)).await;
+        assert_eq!(store.tip(), Some((12, [0x8c; 32])));
+        assert!(store.account(&[10; 20], 12).is_some());
+        assert!(store.account(&[11; 20], 12).is_some());
+        assert!(
+            store.account(&[12; 20], 12).is_none(),
+            "dropped block undone"
+        );
+        assert!(store.account(&[0x8c; 20], 12).is_some());
+        assert_eq!(store.head(12).unwrap().hash, [0x8c; 32]);
     }
 
     #[tokio::test]

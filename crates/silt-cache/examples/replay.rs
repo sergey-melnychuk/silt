@@ -7,8 +7,10 @@
 //! while block N executes on state N-1. Misses take the lookup fast path
 //! pinned at N-1's hash, with JSON-RPC as the fallback. Then diff N is
 //! applied and the next block replays. Folded spans (catch-up after a node
-//! restart) are applied without a replay; a break drops the store to cold
-//! and the next diff reseeds it. Read-only against the node.
+//! restart) are applied without a replay. A reorg rolls the store back to
+//! its fork (PLAN D12) and the new side replays from there; a break, or a
+//! reorg it can't roll back, drops the store to cold and the next diff
+//! reseeds it. Read-only against the node.
 //!
 //! Usage: replay [--feed 127.0.0.1:8585] [--lookup 127.0.0.1:8586]
 //!               [--rpc http://127.0.0.1:8545] [--blocks 20]
@@ -208,7 +210,11 @@ async fn main() -> eyre::Result<()> {
         eyre::bail!("expected Hello");
     };
     write_frame(&mut feed, &silt_wire::hello(chain_id, genesis_hash, 0)).await?;
-    write_frame(&mut feed, &Frame::Subscribe { from: None }).await?;
+    let subscribe = Frame::Subscribe {
+        from: None,
+        parent_hash: None,
+    };
+    write_frame(&mut feed, &subscribe).await?;
     println!(
         "replay: feed {} lookup {} rpc {}, {} blocks",
         args.feed, args.lookup, args.rpc, args.blocks
@@ -219,8 +225,20 @@ async fn main() -> eyre::Result<()> {
         let diff = match read_frame(&mut feed).await? {
             Some(Frame::Diff(diff)) => diff,
             Some(Frame::Heartbeat { .. }) => continue,
-            Some(Frame::Reorg { .. } | Frame::GapTooOld { .. }) => {
-                println!("reorg/gap: store dropped to cold");
+            Some(Frame::Reorg {
+                fork_number,
+                fork_hash,
+            }) => {
+                if store.rollback(fork_number, fork_hash) {
+                    println!("reorg: rolled back to {fork_number}");
+                } else {
+                    println!("reorg to {fork_number}: can't roll back; store dropped to cold");
+                    store.clear();
+                }
+                continue;
+            }
+            Some(Frame::GapTooOld { .. }) => {
+                println!("gap: store dropped to cold");
                 store.clear();
                 continue;
             }

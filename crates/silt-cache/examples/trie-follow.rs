@@ -5,8 +5,10 @@
 //! Seeds cold from the first diff's parent header, so the first blocks fetch
 //! most of what they touch; later blocks fetch only nodes the trie has not
 //! seen. Per block: root match, nodes and bytes fetched, batches and probes,
-//! apply time, and the trie's revealed size. A root mismatch or a failed
-//! update reseeds from the next diff's parent and is counted. Read-only.
+//! apply time, and the trie's revealed size. A reorg rolls the trie back to
+//! its fork (PLAN D12), checked against the fork's header. A root mismatch,
+//! a failed update or a failed rollback reseeds from the next diff's parent
+//! and is counted. Read-only.
 //!
 //! Usage: trie-follow [--feed 127.0.0.1:8585] [--lookup 127.0.0.1:8586]
 //!                    [--rpc http://127.0.0.1:8545] [--blocks 50]
@@ -93,22 +95,58 @@ async fn main() -> eyre::Result<()> {
         eyre::bail!("expected Hello");
     };
     write_frame(&mut feed, &silt_wire::hello(chain_id, genesis_hash, 0)).await?;
-    write_frame(&mut feed, &Frame::Subscribe { from: None }).await?;
+    let subscribe = Frame::Subscribe {
+        from: None,
+        parent_hash: None,
+    };
+    write_frame(&mut feed, &subscribe).await?;
     println!(
         "trie-follow: feed {} lookup {} rpc {}, {} blocks, {:?}",
         args.feed, args.lookup, args.rpc, args.blocks, args.cfg
     );
 
     let (mut checked, mut matched, mut failed, mut reseeds) = (0u64, 0u64, 0u64, 0u64);
+    let mut rollbacks = 0u64;
     let mut ms = Vec::new();
     let mut reseed = true;
     while checked < args.blocks {
         let diff = match read_frame(&mut feed).await? {
             Some(Frame::Diff(diff)) => diff,
-            // A reorg or gap shows up as the next diff not continuing.
-            Some(Frame::Heartbeat { .. } | Frame::Reorg { .. } | Frame::GapTooOld { .. }) => {
+            Some(Frame::Reorg {
+                fork_number,
+                fork_hash,
+            }) => {
+                if reseed || warm.at().is_none() {
+                    continue;
+                }
+                let t = Instant::now();
+                match warm.rollback(fork_number, fork_hash).await {
+                    Ok(root) => {
+                        let want = state_root(&http, &args.rpc, &fork_hash).await?;
+                        let ms = t.elapsed().as_secs_f64() * 1e3;
+                        if root == want {
+                            rollbacks += 1;
+                            println!(
+                                "REORG: rolled back to {fork_number} in {ms:.0} ms; root matches its header"
+                            );
+                        } else {
+                            reseed = true;
+                            println!(
+                                "REORG: rollback to {fork_number} landed on {}, header says {}",
+                                hex_word(&root),
+                                hex_word(&want)
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        reseed = true;
+                        println!("REORG to {fork_number}: {e}; reseeding");
+                    }
+                }
                 continue;
             }
+            // A gap shows up as the next diff not continuing.
+            Some(Frame::Heartbeat { .. } | Frame::GapTooOld { .. }) => continue,
             Some(other) => eyre::bail!("unexpected frame {other:?}"),
             None => eyre::bail!("feed closed"),
         };
@@ -184,7 +222,7 @@ async fn main() -> eyre::Result<()> {
     let p50 = ms.get(ms.len() / 2).copied().unwrap_or(f64::NAN);
     let s = warm.stats();
     println!(
-        "done: {checked} blocks, {matched} roots match, {failed} failed, {reseeds} seeds | apply ms p50 {p50:.0} | \
+        "done: {checked} blocks, {matched} roots match, {failed} failed, {reseeds} seeds, {rollbacks} rollbacks | apply ms p50 {p50:.0} | \
          last trie: {} nodes, {} storage tries, {} prunes",
         s.nodes, s.storage_tries, s.prunes
     );

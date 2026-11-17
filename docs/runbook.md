@@ -141,6 +141,15 @@ or JSON-RPC until the feed has warmed the cache again. A consumer down
 longer than the spool (128 blocks, about 25 minutes) always comes back
 cold.
 
+**Reorgs (D12).** The node sends `Reorg` with the fork block, then the new
+chain's diffs. A consumer rolls its cache back to the fork (undoing only
+what the dropped blocks wrote) and follows the new side; it keeps
+everything else. A consumer that was disconnected through a reorg is told
+the fork when it resubscribes. It drops to cold only if the reorg is
+deeper than its journal (`reorg_depth`, 64 blocks) or cuts through a
+folded catch-up span. `verify` counts rollbacks and checks every key of
+the dropped blocks it still holds against the node at the fork.
+
 ## 7. Roll back
 
 - **To the previous binary:** swap `bin/node.prev` back in, then stop and
@@ -160,6 +169,11 @@ Order matters, because the host and silt must agree on reth:
 2. Bump silt's reth pin to the same rev, re-copy reth's `[patch]` section,
    and fix any API drift (silt-node is the only crate that sees reth).
 3. Point the host's `silt-node` dependency at the new silt commit.
+
+**Wire version.** The feed and lookup protocols require an exact version
+match between the node and its consumers (v2 since D12). Deploy the node
+and its consumers' silt-cache from the same silt release; a mismatch is
+refused at the handshake, never misread.
 
 Gates before deploying:
 - `FULL=1 scripts/ci.sh`;
@@ -184,7 +198,10 @@ Gates before deploying:
 ## 10. Known limits
 
 - No auth, no TLS (D1): network placement is the only access control.
-- A reorg means drop-to-cold (D3); consumers rebuild lazily.
+- A reorg rolls back to its fork (D12). One deeper than 64 blocks, or one
+  that cuts through a folded catch-up span, drops to cold (D3); consumers
+  rebuild lazily. The warm trie (D11) also reseeds if a prune trimmed a
+  node the undo needs.
 - **First-touch block-sized proofs can be slow:** 0.95 s p50 in the node,
   one in 20 took 16 s (`docs/proof-bench.md`). The client's default
   `proof_timeout` is 5 s. Prove warm, in smaller sets, or raise it.

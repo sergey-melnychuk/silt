@@ -187,6 +187,14 @@ ChainSpec>`); the lookup server only needs the node's provider.
   node (2026-11-16): catching up ~45 blocks after a restart took spans of
   2–17 blocks, and the diff stream ran on across the restart with no gap
   or overlap; over the next 24 h, 7,241 diffs, the longest 17 blocks.
+- D12 reorg rollback: a `Reorg` frame names the fork; the store and the
+  warm trie undo, from a per-block journal (64 blocks), only what the
+  dropped blocks wrote, then follow the new side, instead of dropping to
+  cold. The feed drops the dropped blocks' diffs from its spool and tells a
+  consumer that resubscribes from a dropped tip where the fork is. Tests:
+  300 random reorgs where rolling back A and applying B equals following
+  B; trie roots exact after rollback. Wire version 2: the node and its
+  consumers upgrade together. Not yet on the live node.
 - Pending live runs (PLAN M3 gates): the 24 h live-node equivalence soak
   (running since 2026-11-17 13:53 UTC) and the wrapper kill/catch-up test
   under load.

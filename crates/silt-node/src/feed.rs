@@ -1,12 +1,16 @@
 //! Feed publisher: bounded spool + broadcast fan-out + TCP server
 //! (PLAN T1.3/T1.4, D5).
 //!
-//! The ExEx task calls [`Publisher::publish_diff`] / [`publish_reorg`];
+//! The ExEx task calls [`Publisher::publish_diff`] / [`Publisher::publish_reorg`];
 //! `FinishedHeight` is acked by the caller right after `publish_diff`
 //! returns (the frame is then in the spool — D5: node health never depends
 //! on subscriber liveness). Subscribers catch up from the spool; anything
 //! older answers `GapTooOld`. A slow subscriber that lags the broadcast
 //! channel is disconnected and reconnects through the spool.
+//!
+//! A reorg (PLAN D12) drops the spooled diffs above the fork and remembers
+//! the dropped blocks, so a subscriber resuming from a dropped tip is told
+//! where to roll back to before the new side is replayed.
 //!
 //! No socket I/O happens while the spool lock is held, and every subscriber
 //! read/write is deadline-bounded: a client that stops draining can neither
@@ -34,16 +38,46 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// start while replay order and dedupe go by its tip.
 type Spooled = (u64, u64, Arc<Vec<u8>>);
 
+/// A fork point: (number, hash) of the last block both chains share.
+pub type Fork = (u64, Word);
+
+#[derive(Default)]
+struct Spool {
+    diffs: VecDeque<Spooled>,
+    /// Blocks reorgs dropped, oldest first: (block hash, its fork).
+    dropped: VecDeque<(Word, Fork)>,
+}
+
+impl Spool {
+    /// Where a client whose tip is `hash` must roll back to: the fork of
+    /// the reorg that dropped it, followed down through later reorgs that
+    /// dropped that fork too. `None` if no reorg dropped `hash`.
+    fn fork_of(&self, hash: &Word) -> Option<Fork> {
+        let find = |h: &Word| self.dropped.iter().find(|(d, _)| d == h).map(|(_, f)| *f);
+        let mut fork = find(hash)?;
+        for _ in 0..self.dropped.len() {
+            match find(&fork.1) {
+                Some(deeper) => fork = deeper,
+                None => break,
+            }
+        }
+        Some(fork)
+    }
+}
+
 #[derive(Clone)]
 enum Out {
     /// A diff frame, tagged with its tip number for replay bookkeeping.
     Diff(u64, Arc<Vec<u8>>),
-    /// Reorg marker / heartbeat — forwarded as-is.
+    /// A reorg marker, tagged with its fork number: what was sent above it
+    /// is gone, so replay bookkeeping rewinds to it.
+    Reorg(u64, Arc<Vec<u8>>),
+    /// Heartbeat — forwarded as-is.
     Raw(Arc<Vec<u8>>),
 }
 
 pub struct Publisher {
-    spool: RwLock<VecDeque<Spooled>>,
+    spool: RwLock<Spool>,
     spool_cap: usize,
     tx: broadcast::Sender<Out>,
     /// Identity for the Hello frame.
@@ -59,7 +93,7 @@ impl Publisher {
     pub fn new(chain_id: u64, genesis_hash: Word, spool_cap: usize) -> Arc<Self> {
         let (tx, _) = broadcast::channel(256);
         Arc::new(Self {
-            spool: RwLock::new(VecDeque::new()),
+            spool: RwLock::new(Spool::default()),
             spool_cap,
             tx,
             chain_id,
@@ -75,7 +109,7 @@ impl Publisher {
     }
 
     pub async fn spool_depth(&self) -> u32 {
-        self.spool.read().await.len() as u32
+        self.spool.read().await.diffs.len() as u32
     }
 
     /// Spools + fans out one diff. After this returns the frame is durable
@@ -85,9 +119,11 @@ impl Publisher {
         let bytes = Arc::new(Frame::Diff(diff.clone()).encode()?);
         {
             let mut spool = self.spool.write().await;
-            spool.push_back((diff.span_start, number, bytes.clone()));
-            while spool.len() > self.spool_cap {
-                spool.pop_front();
+            spool
+                .diffs
+                .push_back((diff.span_start, number, bytes.clone()));
+            while spool.diffs.len() > self.spool_cap {
+                spool.diffs.pop_front();
             }
         }
         self.height
@@ -96,12 +132,31 @@ impl Publisher {
         Ok(())
     }
 
-    pub async fn publish_reorg(&self, new_tip_number: u64, new_tip_hash: Word) -> eyre::Result<()> {
-        let frame = Frame::Reorg {
-            new_tip_number,
-            new_tip_hash,
-        };
-        let _ = self.tx.send(Out::Raw(Arc::new(frame.encode()?)));
+    /// Everything above `fork` was replaced or reverted (PLAN D12):
+    /// `dropped` are the old chain's blocks (number, hash). Their spooled
+    /// diffs go, including a folded span that reaches above the fork; the
+    /// new side's diffs are published next.
+    pub async fn publish_reorg(&self, fork: Fork, dropped: &[(u64, Word)]) -> eyre::Result<()> {
+        let bytes = Arc::new(
+            Frame::Reorg {
+                fork_number: fork.0,
+                fork_hash: fork.1,
+            }
+            .encode()?,
+        );
+        {
+            let mut spool = self.spool.write().await;
+            spool.diffs.retain(|(_, number, _)| *number <= fork.0);
+            for (_, hash) in dropped {
+                spool.dropped.push_back((*hash, fork));
+            }
+            while spool.dropped.len() > self.spool_cap.max(1) {
+                spool.dropped.pop_front();
+            }
+        }
+        self.height
+            .store(fork.0, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.tx.send(Out::Reorg(fork.0, bytes));
         Ok(())
     }
 
@@ -138,9 +193,12 @@ impl Publisher {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let from = tokio::time::timeout(self.handshake_timeout, self.handshake(&mut stream))
-            .await
-            .map_err(|_| eyre::eyre!("handshake timed out after {:?}", self.handshake_timeout))??;
+        let (from, parent_hash) =
+            tokio::time::timeout(self.handshake_timeout, self.handshake(&mut stream))
+                .await
+                .map_err(|_| {
+                    eyre::eyre!("handshake timed out after {:?}", self.handshake_timeout)
+                })??;
 
         // Subscribe to live fan-out BEFORE snapshotting the spool so nothing
         // falls between replay and live; duplicates are skipped by number.
@@ -149,17 +207,24 @@ impl Publisher {
         // subscriber that stops draining mid-write must never hold the spool
         // lock, or publish_diff's write lock queues behind it and the ExEx
         // stops acking FinishedHeight (D5).
-        let (gap, replay): (Option<u64>, Vec<Spooled>) = {
+        let (fork, gap, replay): (Option<Fork>, Option<u64>, Vec<Spooled>) = {
             let spool = self.spool.read().await;
+            // A tip that a reorg dropped resumes from its fork (D12).
+            let fork = parent_hash.and_then(|h| spool.fork_of(&h));
+            let from = fork.map_or(from, |(n, _)| Some(n + 1));
             // `from` is servable while some spooled span covers it: a span
             // that started below `from` is replayed whole (the client
             // applies it as an overlap of its tip).
-            match (from, spool.front()) {
-                (None, _) => (None, Vec::new()),
-                (Some(from), Some(&(oldest, _, _))) if from < oldest => (Some(oldest), Vec::new()),
+            match (from, spool.diffs.front()) {
+                (None, _) => (None, None, Vec::new()),
+                (Some(from), Some(&(oldest, _, _))) if from < oldest => {
+                    (None, Some(oldest), Vec::new())
+                }
                 (Some(from), _) => (
+                    fork,
                     None,
                     spool
+                        .diffs
                         .iter()
                         .filter(|(_, n, _)| *n >= from)
                         .cloned()
@@ -167,6 +232,14 @@ impl Publisher {
                 ),
             }
         };
+        if let Some((fork_number, fork_hash)) = fork {
+            let frame = Frame::Reorg {
+                fork_number,
+                fork_hash,
+            }
+            .encode()?;
+            stream_write(&mut stream, &frame, self.write_timeout).await?;
+        }
         if let Some(oldest_available) = gap {
             // Beyond the spool: tell the client to cold-rebuild, then
             // continue live from now.
@@ -188,6 +261,11 @@ impl Publisher {
                     stream_write(&mut stream, &bytes, self.write_timeout).await?;
                     last_sent = number;
                 }
+                Ok(Out::Reorg(fork, bytes)) => {
+                    stream_write(&mut stream, &bytes, self.write_timeout).await?;
+                    // The new side's diffs can reuse heights already sent.
+                    last_sent = last_sent.min(fork);
+                }
                 Ok(Out::Raw(bytes)) => {
                     stream_write(&mut stream, &bytes, self.write_timeout).await?
                 }
@@ -201,8 +279,9 @@ impl Publisher {
         }
     }
 
-    /// Hello exchange, then the client's `Subscribe`; returns its `from`.
-    async fn handshake<S>(&self, stream: &mut S) -> eyre::Result<Option<u64>>
+    /// Hello exchange, then the client's `Subscribe`; returns its `from`
+    /// and `parent_hash`.
+    async fn handshake<S>(&self, stream: &mut S) -> eyre::Result<(Option<u64>, Option<Word>)>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -221,10 +300,10 @@ impl Publisher {
             .await?;
             eyre::bail!("refused: {reason}");
         }
-        let Some(Frame::Subscribe { from }) = read_frame(stream).await? else {
+        let Some(Frame::Subscribe { from, parent_hash }) = read_frame(stream).await? else {
             eyre::bail!("expected Subscribe");
         };
-        Ok(from)
+        Ok((from, parent_hash))
     }
 }
 
@@ -259,10 +338,21 @@ mod tests {
     const SHORT: Duration = Duration::from_millis(200);
 
     fn diff(number: u64) -> BlockDiff {
+        diff_on(number, 0)
+    }
+
+    /// Block `number` of fork `side` (0 = the first chain).
+    fn hash(number: u64, side: u8) -> Word {
+        let mut h = [number as u8; 32];
+        h[0] = side;
+        h
+    }
+
+    fn diff_on(number: u64, side: u8) -> BlockDiff {
         BlockDiff {
             span_start: number,
             number,
-            hash: [number as u8; 32],
+            hash: hash(number, side),
             parent_hash: [0; 32],
             heads: vec![],
             accounts: vec![],
@@ -294,12 +384,20 @@ mod tests {
 
     /// Client half of the handshake.
     async fn subscribe(client: &mut DuplexStream, from: Option<u64>) {
+        subscribe_after(client, from, None).await
+    }
+
+    async fn subscribe_after(
+        client: &mut DuplexStream,
+        from: Option<u64>,
+        parent_hash: Option<Word>,
+    ) {
         let theirs = read_frame(client).await.unwrap().unwrap();
         assert!(matches!(theirs, Frame::Hello { .. }), "{theirs:?}");
         write_frame(client, &hello(CHAIN_ID, GENESIS, 0))
             .await
             .unwrap();
-        write_frame(client, &Frame::Subscribe { from })
+        write_frame(client, &Frame::Subscribe { from, parent_hash })
             .await
             .unwrap();
     }
@@ -356,6 +454,87 @@ mod tests {
             },
             "a block before the span's start is gone"
         );
+    }
+
+    fn reorg(fork_number: u64, side: u8) -> Frame {
+        Frame::Reorg {
+            fork_number,
+            fork_hash: hash(fork_number, side),
+        }
+    }
+
+    /// D12: a live subscriber gets the marker, then the replacement block
+    /// at a height it was already sent (it used to be skipped as a
+    /// re-delivery).
+    #[tokio::test]
+    async fn a_live_subscriber_gets_the_reorg_then_the_replacement_block() {
+        let p = publisher(8, WRITE_TIMEOUT, 3).await;
+        let (mut c, _server) = connect(&p, 1 << 16);
+        subscribe(&mut c, Some(1)).await;
+        for n in 1..=3 {
+            assert_eq!(next(&mut c).await, Frame::Diff(diff(n)));
+        }
+        p.publish_reorg((2, hash(2, 0)), &[(3, hash(3, 0))])
+            .await
+            .unwrap();
+        p.publish_diff(&diff_on(3, 1)).await.unwrap();
+        assert_eq!(next(&mut c).await, reorg(2, 0));
+        assert_eq!(next(&mut c).await, Frame::Diff(diff_on(3, 1)));
+        assert_eq!(p.height(), 3);
+    }
+
+    #[tokio::test]
+    async fn the_spool_forgets_dropped_blocks() {
+        let p = publisher(8, WRITE_TIMEOUT, 3).await;
+        p.publish_reorg((1, hash(1, 0)), &[(2, hash(2, 0)), (3, hash(3, 0))])
+            .await
+            .unwrap();
+        assert_eq!(p.height(), 1);
+        assert_eq!(p.spool_depth().await, 1);
+        p.publish_diff(&diff_on(2, 1)).await.unwrap();
+        let (mut c, _server) = connect(&p, 1 << 16);
+        subscribe(&mut c, Some(2)).await;
+        assert_eq!(next(&mut c).await, Frame::Diff(diff_on(2, 1)));
+    }
+
+    /// D12: a client whose tip a reorg dropped resumes at the fork.
+    #[tokio::test]
+    async fn a_dropped_tip_resumes_with_reorg_then_the_new_side() {
+        let p = publisher(8, WRITE_TIMEOUT, 3).await;
+        p.publish_reorg((1, hash(1, 0)), &[(2, hash(2, 0)), (3, hash(3, 0))])
+            .await
+            .unwrap();
+        p.publish_diff(&diff_on(2, 1)).await.unwrap();
+        p.publish_diff(&diff_on(3, 1)).await.unwrap();
+        let (mut c, _server) = connect(&p, 1 << 16);
+        subscribe_after(&mut c, Some(4), Some(hash(3, 0))).await;
+        assert_eq!(next(&mut c).await, reorg(1, 0));
+        assert_eq!(next(&mut c).await, Frame::Diff(diff_on(2, 1)));
+        assert_eq!(next(&mut c).await, Frame::Diff(diff_on(3, 1)));
+
+        // A tip on the live chain resumes as before, with no marker.
+        let (mut c, _server) = connect(&p, 1 << 16);
+        subscribe_after(&mut c, Some(3), Some(hash(2, 1))).await;
+        assert_eq!(next(&mut c).await, Frame::Diff(diff_on(3, 1)));
+    }
+
+    /// A tip dropped by one reorg whose fork a later, deeper reorg dropped
+    /// too rolls back to the deeper fork.
+    #[tokio::test]
+    async fn nested_reorgs_resume_at_the_deepest_fork() {
+        let p = publisher(8, WRITE_TIMEOUT, 3).await;
+        p.publish_reorg((2, hash(2, 0)), &[(3, hash(3, 0))])
+            .await
+            .unwrap();
+        p.publish_diff(&diff_on(3, 1)).await.unwrap();
+        p.publish_reorg((1, hash(1, 0)), &[(2, hash(2, 0)), (3, hash(3, 1))])
+            .await
+            .unwrap();
+        p.publish_diff(&diff_on(2, 2)).await.unwrap();
+        let (mut c, _server) = connect(&p, 1 << 16);
+        subscribe_after(&mut c, Some(4), Some(hash(3, 0))).await;
+        assert_eq!(next(&mut c).await, reorg(1, 0));
+        assert_eq!(next(&mut c).await, Frame::Diff(diff_on(2, 2)));
     }
 
     #[tokio::test]

@@ -17,8 +17,11 @@
 //! resubscribing after the last block it received. The checker also
 //! classifies continuity like the cache's client
 //! ([`silt_cache::client::continuity`]): a span overlapping the tip after a
-//! node restart is applied, a re-delivered diff is skipped, and a jump, a
-//! fork, a `GapTooOld` or a `Reorg` drops the store to cold; all counted.
+//! node restart is applied, a re-delivered diff is skipped, a `Reorg` rolls
+//! the store back to its fork (PLAN D12), and a jump, a fork, a `GapTooOld`
+//! or a reorg it can't roll back drops the store to cold; all counted.
+//! After a rollback, every key the dropped blocks touched that the store
+//! still holds is checked against RPC pinned at the fork block.
 //!
 //! RPC calls are retried (3 attempts over ~3 s); a key whose call still
 //! fails — the node restarting, or the block pruned or reorged away —
@@ -33,8 +36,8 @@
 //! Usage: verify [feed-addr] [rpc-url] [--blocks N] [--hours H]
 //!               [--summary-mins 60] [--evict-after 64] [--concurrency 16]
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
@@ -128,7 +131,10 @@ enum Event {
         replayed: bool,
     },
     Gap(u64),
-    Reorg(u64),
+    Reorg {
+        fork_number: u64,
+        fork_hash: Word,
+    },
     Disconnected(String),
 }
 
@@ -148,13 +154,17 @@ async fn read_sized<R: AsyncRead + Unpin>(r: &mut R) -> eyre::Result<Option<(Fra
     Ok(Some((Frame::decode(&buf)?, 4 + len as usize)))
 }
 
-/// One connection: handshake, subscribe after `last` (the newest block
-/// received so far, 0 = none), forward frames until EOF/error/silence.
-async fn stream_once(
-    feed: &str,
-    last: &AtomicU64,
-    tx: &UnboundedSender<Event>,
-) -> eyre::Result<()> {
+/// A diff's block number and the accounts and slots it wrote.
+type Touched = (u64, Vec<Addr>, Vec<(Addr, Word)>);
+
+/// The newest block the stream is on: the last diff received, or the fork
+/// a reorg rolled back to. `None` = nothing yet.
+type Last = Mutex<Option<(u64, Word)>>;
+
+/// One connection: handshake, subscribe after `last` (with its hash, so a
+/// tip a reorg dropped meanwhile is answered with the fork, D12), forward
+/// frames until EOF/error/silence.
+async fn stream_once(feed: &str, last: &Last, tx: &UnboundedSender<Event>) -> eyre::Result<()> {
     let mut stream = tokio::net::TcpStream::connect(feed).await?;
     let Some((
         Frame::Hello {
@@ -169,11 +179,13 @@ async fn stream_once(
         eyre::bail!("expected Hello");
     };
     write_frame(&mut stream, &silt_wire::hello(chain_id, genesis_hash, 0)).await?;
-    let from = match last.load(Ordering::Relaxed) {
-        0 => None,
-        n => Some(n + 1),
+    let after = *last.lock().expect("last lock");
+    let from = after.map(|(n, _)| n + 1);
+    let subscribe = Frame::Subscribe {
+        from,
+        parent_hash: after.map(|(_, h)| h),
     };
-    write_frame(&mut stream, &Frame::Subscribe { from }).await?;
+    write_frame(&mut stream, &subscribe).await?;
     loop {
         let frame = tokio::time::timeout(Duration::from_secs(30), read_sized(&mut stream))
             .await
@@ -184,7 +196,7 @@ async fn stream_once(
         let received_ms = now_ms();
         let event = match frame {
             Frame::Diff(diff) => {
-                last.store(diff.number, Ordering::Relaxed);
+                *last.lock().expect("last lock") = Some((diff.number, diff.hash));
                 Event::Diff {
                     replayed: from.is_some() && diff.number <= tip,
                     diff,
@@ -193,7 +205,16 @@ async fn stream_once(
                 }
             }
             Frame::GapTooOld { oldest_available } => Event::Gap(oldest_available),
-            Frame::Reorg { new_tip_number, .. } => Event::Reorg(new_tip_number),
+            Frame::Reorg {
+                fork_number,
+                fork_hash,
+            } => {
+                *last.lock().expect("last lock") = Some((fork_number, fork_hash));
+                Event::Reorg {
+                    fork_number,
+                    fork_hash,
+                }
+            }
             Frame::Heartbeat { .. } => continue,
             other => eyre::bail!("unexpected frame: {other:?}"),
         };
@@ -204,7 +225,7 @@ async fn stream_once(
 }
 
 async fn reader(feed: String, tx: UnboundedSender<Event>) {
-    let last = AtomicU64::new(0);
+    let last: Last = Mutex::new(None);
     loop {
         let why = match stream_once(&feed, &last, &tx).await {
             Ok(()) => "eof".to_string(),
@@ -345,6 +366,10 @@ struct Window {
     reconnects: u64,
     gaps: u64,
     reorgs: u64,
+    /// Reorgs rolled back (the rest dropped to cold), and the keys of
+    /// their dropped blocks checked at the fork.
+    rollbacks: u64,
+    rollback_keys: u64,
     breaks: u64,
     overlaps: u64,
     stale: u64,
@@ -383,6 +408,8 @@ impl Window {
         self.reconnects += o.reconnects;
         self.gaps += o.gaps;
         self.reorgs += o.reorgs;
+        self.rollbacks += o.rollbacks;
+        self.rollback_keys += o.rollback_keys;
         self.breaks += o.breaks;
         self.overlaps += o.overlaps;
         self.stale += o.stale;
@@ -398,7 +425,7 @@ impl Window {
         let hours = elapsed.as_secs_f64() / 3600.0;
         format!(
             "SUMMARY {label} (+{hours:.2} h): blocks {} in {} diffs, keys {}, mismatches {}, unverifiable {}, \
-             reconnects {}, gaps {}, reorgs {}, breaks {}, overlaps {}, stale {} | latency ms p50/p99/max {} | bytes/block p50/p99/max {} \
+             reconnects {}, gaps {}, reorgs {} (rolled back {}, {} keys checked), breaks {}, overlaps {}, stale {} | latency ms p50/p99/max {} | bytes/block p50/p99/max {} \
              ({:.1} MiB) | apply µs p50/p99/max {} | check ms p50/p99/max {} | store {} accounts {} slots | rss {:.0} MiB",
             self.blocks,
             self.diffs,
@@ -408,6 +435,8 @@ impl Window {
             self.reconnects,
             self.gaps,
             self.reorgs,
+            self.rollbacks,
+            self.rollback_keys,
             self.breaks,
             self.overlaps,
             self.stale,
@@ -428,6 +457,8 @@ async fn main() -> eyre::Result<()> {
     let args = args()?;
     let rpc = HttpFallback::new(args.rpc.clone());
     let store = Store::new(256);
+    // Keys of the last diffs applied, for checking a rollback.
+    let mut recent: VecDeque<Touched> = VecDeque::new();
     let (tx, mut rx) = unbounded_channel();
     tokio::spawn(reader(args.feed.clone(), tx));
     println!(
@@ -478,12 +509,92 @@ async fn main() -> eyre::Result<()> {
             Some(Event::Gap(oldest)) => {
                 window.gaps += 1;
                 store.clear();
+                recent.clear();
                 println!("GAP: spool starts at {oldest}; store dropped to cold");
             }
-            Some(Event::Reorg(tip)) => {
+            Some(Event::Reorg {
+                fork_number,
+                fork_hash,
+            }) => {
                 window.reorgs += 1;
-                store.clear();
-                println!("REORG to {tip}; store dropped to cold");
+                let tip = store.tip().map_or(0, |(n, _)| n);
+                if !store.rollback(fork_number, fork_hash) {
+                    store.clear();
+                    recent.clear();
+                    println!(
+                        "REORG to fork {fork_number} from {tip}: can't roll back; store dropped to cold"
+                    );
+                    continue;
+                }
+                window.rollbacks += 1;
+                // Whatever the store still holds for a key the dropped
+                // blocks touched must be the fork's value.
+                let dropped: Vec<Touched> = recent
+                    .iter()
+                    .filter(|(n, _, _)| *n > fork_number)
+                    .cloned()
+                    .collect();
+                recent.retain(|(n, _, _)| *n <= fork_number);
+                let mut accounts = BTreeSet::new();
+                let mut slots = BTreeSet::new();
+                for (_, a, s) in &dropped {
+                    accounts.extend(a.iter().copied());
+                    slots.extend(s.iter().copied());
+                }
+                let held_accounts: Vec<(Addr, (Word, u64, Word))> = accounts
+                    .into_iter()
+                    .filter_map(|a| {
+                        let e = store.account(&a, fork_number)?;
+                        Some((a, (e.balance, e.nonce, e.code_hash)))
+                    })
+                    .collect();
+                let held_slots: Vec<(Addr, Word, Word)> = slots
+                    .into_iter()
+                    .filter_map(|(a, s)| Some((a, s, store.slot(&a, &s, fork_number)?)))
+                    .collect();
+                let checks = held_slots
+                    .iter()
+                    .map(|&(a, s, v)| {
+                        futures::future::Either::Left(check_slot(
+                            &rpc,
+                            fork_number,
+                            &fork_hash,
+                            a,
+                            s,
+                            v,
+                        ))
+                    })
+                    .chain(held_accounts.iter().map(|&(a, want)| {
+                        futures::future::Either::Right(check_account(
+                            &rpc,
+                            fork_number,
+                            &fork_hash,
+                            a,
+                            Some(want),
+                        ))
+                    }));
+                let results: Vec<Check> = futures::stream::iter(checks)
+                    .buffer_unordered(args.concurrency)
+                    .collect()
+                    .await;
+                let mut bad = 0u64;
+                for r in &results {
+                    match r {
+                        Check::Ok => {}
+                        Check::Mismatch(line) => {
+                            bad += 1;
+                            println!("MISMATCH after rollback: {line}");
+                        }
+                        Check::Unverifiable(_) => window.unverifiable += 1,
+                    }
+                }
+                window.mismatches += bad;
+                window.rollback_keys += results.len() as u64;
+                println!(
+                    "REORG: rolled back {} block(s) from {tip} to fork {fork_number}; {} held keys of the dropped blocks checked at the fork, {bad} mismatched",
+                    tip - fork_number,
+                    results.len()
+                );
             }
             Some(Event::Diff {
                 diff,
@@ -509,6 +620,7 @@ async fn main() -> eyre::Result<()> {
                         window.breaks += 1;
                         let tip = store.tip().map_or(0, |(n, _)| n);
                         store.clear();
+                        recent.clear();
                         println!(
                             "BREAK: diff {}..{} does not extend {tip}; store dropped to cold",
                             diff.span_start, diff.number
@@ -518,6 +630,14 @@ async fn main() -> eyre::Result<()> {
                 let t = Instant::now();
                 store.apply(&diff);
                 let apply_us = t.elapsed().as_secs_f64() * 1e6;
+                recent.push_back((
+                    diff.number,
+                    diff.accounts.iter().map(|(a, _)| *a).collect(),
+                    diff.storage.iter().map(|(a, s, _)| (*a, *s)).collect(),
+                ));
+                while recent.len() > silt_cache::store::DEFAULT_REORG_DEPTH {
+                    recent.pop_front();
+                }
                 if diff.number.is_multiple_of(8) {
                     store.evict(diff.number, args.evict_after);
                 }
@@ -620,6 +740,10 @@ async fn main() -> eyre::Result<()> {
     println!(
         "| reconnects / gaps / reorgs / breaks | {} / {} / {} / {} |",
         total.reconnects, total.gaps, total.reorgs, total.breaks
+    );
+    println!(
+        "| reorgs rolled back (dropped-block keys checked at the fork) | {} ({}) |",
+        total.rollbacks, total.rollback_keys
     );
     println!(
         "| re-deliveries after a node restart: overlapping spans / stale diffs | {} / {} |",

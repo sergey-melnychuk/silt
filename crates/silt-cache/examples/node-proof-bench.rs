@@ -102,7 +102,11 @@ async fn recent_diffs(feed: &str, n: usize) -> eyre::Result<Vec<BlockDiff>> {
     };
     write_frame(&mut stream, &silt_wire::hello(chain_id, genesis_hash, 0)).await?;
     let from = tip.saturating_sub(n as u64 - 1);
-    write_frame(&mut stream, &Frame::Subscribe { from: Some(from) }).await?;
+    let subscribe = Frame::Subscribe {
+        from: Some(from),
+        parent_hash: None,
+    };
+    write_frame(&mut stream, &subscribe).await?;
     let mut diffs = Vec::new();
     let mut folded = 0;
     while diffs.len() < n {
