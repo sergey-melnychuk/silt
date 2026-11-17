@@ -32,6 +32,10 @@ yevm's trait. The core crate has **no yevm dependency**.
   refill lazily. A provenance bit (diff-applied vs lazily-fetched) is
   reserved on every cache entry **now** so a future layered/versioned
   design stays cheap; no other reorg machinery in v0.
+  **Amended (2026-11-17, D12): a `Reorg` frame rolls the cache back to
+  the fork** and the new chain's diffs apply on top. Drop-to-cold remains
+  the answer to every other break, and to reorgs deeper than the undo
+  journal.
 - **D4 — Wire types are dependency-free primitives** (`[u8;20]`, `[u8;32]`,
   `u64`, `Vec<u8>`). Each side adapts to its native types (alloy in the
   wrapper, yevm/whatever in consumers). CI enforces the dependency
@@ -310,6 +314,50 @@ yevm's trait. The core crate has **no yevm dependency**.
   untouched for `storage_ttl` blocks are dropped. A fetch that fails
   mid-update drops the trie to cold; the consumer reseeds it from a
   header's state root. reth-free: CI checks that `trie` pulls no reth.
+- **D12 — Reorgs roll back; drop-to-cold is the fallback (2026-11-17).**
+  Under D3 every reorg cost a consumer its whole cache and its warm trie,
+  about five times a day on mainnet. Yet a reorg is almost always one
+  block deep and only invalidates the keys its dropped blocks wrote
+  (about 1,400 a block). The cache holds what it needs to undo them.
+  - **Feed.** `Reorg { fork_number, fork_hash }` names the common
+    ancestor F, the new chain's parent; the new chain's diffs follow from
+    F+1. A revert without a new chain sends the same frame. The spool
+    drops every diff above F. The publisher remembers each dropped
+    block's `(number, hash)` with its fork (bounded like the spool), and
+    `Subscribe` carries the hash of the consumer's tip: a consumer whose
+    tip a reorg dropped gets `Reorg` at the deepest fork, then the spool
+    from F+1, instead of a parent mismatch. Live subscribers rewind their
+    replay bookkeeping to F, so a replacement block at a height they
+    already passed is sent (before, it was skipped as a re-delivery).
+  - **Store.** Applying a diff journals, for every key it writes or
+    removes, the entry it replaced (or "absent": not held). A lazy fill
+    journals "absent" under the block current when it lands.
+    `rollback(F, hash)` needs the ring to hold F with that hash and the
+    journal to reach back to F+1 on diff boundaries; it then undoes the
+    journal newest-first, drops the heads above F and sets the tip to F.
+    Anything else drops to cold. It is exact by construction: it restores
+    what the store held at F, and a key it leaves absent is read at the
+    new tip. Depth `reorg_depth`, default 64 blocks (about finality), at
+    roughly 150 KB a block. Every rollback or clear bumps an epoch, and a
+    lazy fill pinned before the bump is discarded. That also closes a
+    race in D3: a fill pinned at a dropped block that landed after the
+    clear stayed in the cache.
+  - **Warm trie (D11).** Journals every leaf it replaces (account leaves,
+    slot values), every storage trie it drops for a destroyed account,
+    and its root before each diff. Rollback re-applies the old leaves
+    newest-first. A node a collapse needs is fetched pinned at F: nodes
+    are content-addressed, so any node unchanged since F verifies. The
+    result must equal the journaled root at F, or the trie reseeds.
+    Depth: the smaller of `reorg_depth` and `storage_ttl`.
+  - **Events.** A rolled-back reorg emits `HeadEvent::Reorg { fork_number,
+    fork_hash }` instead of `ChainBreak`: reads are coherent at F at
+    once; work pinned above F should be cancelled.
+  - **Wire version 2** (`Subscribe` and `Reorg` changed; exact match).
+  - Not chosen: a server-built reorg diff (every key the dropped blocks
+    touched, at its new-tip value, from the old chain's bundle reverts).
+    It depends on reth's reverts being complete, which D6's cap found they
+    sometimes are not, and the warm trie would have to fetch nodes at a
+    dropped block.
 
 ## 1. Architecture
 
@@ -337,10 +385,14 @@ Frames (postcard-encoded enum, `u32` LE length prefix):
 
 - `Hello { magic, version, chain_id, genesis_hash, tip }` — both directions
   first; any mismatch → close with `Refused { reason }`.
-- `Subscribe { from: Option<u64> }` — client→server; `None` = from tip.
+- `Subscribe { from: Option<u64>, parent_hash: Option<Word> }` —
+  client→server; `None` = from tip. `parent_hash` is the hash of block
+  `from - 1`, the client's tip, so the server can tell a tip that a reorg
+  dropped (D12).
 - `Diff(BlockDiff)` — server→client.
-- `Reorg { new_tip_number, new_tip_hash }` — server→client marker; the new
-  side's `Diff` (whose `parent_hash` points below the fork) follows.
+- `Reorg { fork_number, fork_hash }` — server→client: everything above
+  the fork was replaced; the new side's diffs follow from
+  `fork_number + 1` (D12). Version 2; v1's frame named only the new tip.
 - `Heartbeat { height, spool_depth }` — server→client, ~10 s.
 - `GapTooOld { oldest_available }` — server→client answer to an
   unserviceable `Subscribe`.
@@ -488,7 +540,8 @@ observed by a subscriber (dedupe works).
   cache, so `Executor::run(tx, head, &mut cache.overlay(), &cache)`
   works out of the box. Core crate
   still compiles without yevm.
-- **T2.5** Drop-to-cold: on Reorg frame / parent mismatch / `GapTooOld` /
+- **T2.5** Drop-to-cold (D12: a `Reorg` frame rolls back first, and
+  drops only if it can't): on Reorg frame / parent mismatch / `GapTooOld` /
   decode error → clear store, resubscribe at tip, emit `ChainBreak` so the
   consumer can cancel in-flight work. Feed-down semantics: no head events
   are emitted while disconnected; reads stay valid for the last coherent
@@ -686,7 +739,7 @@ that installs silt-node.
 
 ## 7. Out of scope (v0)
 
-Layered/versioned reorg recovery (provenance bit reserved; design exists),
+Reorgs deeper than the undo journal (D12; they drop to cold),
 TLS/auth on the feed, compression, receipt storage/consumption (receipts
 ride the wire; the cache exposes them as a raw stream and drops them),
 multi-node fan-in, historical backfill beyond the spool.
