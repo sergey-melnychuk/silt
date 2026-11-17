@@ -193,8 +193,9 @@ ChainSpec>`); the lookup server only needs the node's provider.
   cold. The feed drops the dropped blocks' diffs from its spool and tells a
   consumer that resubscribes from a dropped tip where the fork is. Tests:
   300 random reorgs where rolling back A and applying B equals following
-  B; trie roots exact after rollback. Wire version 2: the node and its
-  consumers upgrade together. Not yet on the live node.
+  B; trie roots exact after rollback. The frames changed without a
+  protocol version bump: every consumer is ours and is rebuilt with the
+  node.
 - Pending live runs (PLAN M3 gates): the 24 h live-node equivalence soak
   (running since 2026-11-17 13:53 UTC) and the wrapper kill/catch-up test
   under load.

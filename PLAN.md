@@ -19,7 +19,8 @@ yevm's trait. The core crate has **no yevm dependency**.
 
 - **D1 — Transport is a custom RPC over TCP** (not a Unix socket: consumer
   may live on another machine). Length-prefixed (`u32` LE) postcard frames,
-  versioned handshake, exact-version match in v0. Push stream + one request
+  handshake with an exact-match `VERSION`, not bumped while every consumer
+  is ours (see D12). Push stream + one request
   (`Subscribe { from }`). No TLS/auth in v0: bind to a private interface /
   WireGuard; documented as an ops constraint, revisit if that ever changes.
 - **D2 — Standard JSON-RPC is always the fallback** (`eth_getStorageAt`,
@@ -352,7 +353,11 @@ yevm's trait. The core crate has **no yevm dependency**.
   - **Events.** A rolled-back reorg emits `HeadEvent::Reorg { fork_number,
     fork_hash }` instead of `ChainBreak`: reads are coherent at F at
     once; work pinned above F should be cancelled.
-  - **Wire version 2** (`Subscribe` and `Reorg` changed; exact match).
+  - **No version bump.** `Subscribe` and `Reorg` changed shape, but silt
+    has no consumers outside our control, so the protocol isn't versioned
+    yet (2026-11-17): the node and its consumers ship from the same silt
+    commit, and `VERSION` stays at the value D12 shipped with (2). Start
+    versioning when a consumer we don't deploy appears.
   - Not chosen: a server-built reorg diff (every key the dropped blocks
     touched, at its new-tip value, from the old chain's bundle reverts).
     It depends on reth's reverts being complete, which D6's cap found they
@@ -392,7 +397,7 @@ Frames (postcard-encoded enum, `u32` LE length prefix):
 - `Diff(BlockDiff)` — server→client.
 - `Reorg { fork_number, fork_hash }` — server→client: everything above
   the fork was replaced; the new side's diffs follow from
-  `fork_number + 1` (D12). Version 2; v1's frame named only the new tip.
+  `fork_number + 1` (D12). Before D12 the frame named only the new tip.
 - `Heartbeat { height, spool_depth }` — server→client, ~10 s.
 - `GapTooOld { oldest_available }` — server→client answer to an
   unserviceable `Subscribe`.

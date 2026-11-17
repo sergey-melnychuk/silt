@@ -170,10 +170,11 @@ Order matters, because the host and silt must agree on reth:
    and fix any API drift (silt-node is the only crate that sees reth).
 3. Point the host's `silt-node` dependency at the new silt commit.
 
-**Wire version.** The feed and lookup protocols require an exact version
-match between the node and its consumers (v2 since D12). Deploy the node
-and its consumers' silt-cache from the same silt release; a mismatch is
-refused at the handshake, never misread.
+**Wire compatibility.** The protocol isn't versioned yet: every consumer
+is ours, so frames change without a version bump (PLAN D12). Build the
+node and its consumers (silt-cache, `verify`, the other tools) from the
+same silt commit. A consumer from an older commit can fail to decode the
+newer frames rather than be refused at the handshake.
 
 Gates before deploying:
 - `FULL=1 scripts/ci.sh`;

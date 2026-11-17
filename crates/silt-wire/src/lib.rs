@@ -15,7 +15,9 @@ pub mod lookup;
 pub const MAGIC: [u8; 4] = *b"SILT";
 /// Covers the feed and the lookup protocol (PLAN D9): `0` at D9, `1` since
 /// D10 added op `Proof` and status `TooLarge`, `2` since D12 changed
-/// `Subscribe` and `Reorg`.
+/// `Subscribe` and `Reorg`. Not bumped any more for now: every consumer is
+/// ours and ships from the same commit as the node, so frames change
+/// freely. Versioning resumes once a consumer we don't deploy exists.
 pub const VERSION: u16 = 2;
 /// Upper bound on a single frame; a mainnet block diff is ~100-400 KB, so
 /// this is generous headroom while still rejecting garbage lengths.
