@@ -68,7 +68,7 @@ yevm's trait. The core crate has **no yevm dependency**.
   stock-executor `silt-exex`, or a node with its own executor — carries
   the same capabilities. The reth pin is one workspace dependency; a host
   must build against that same reth (one binary can't mix reth versions),
-  so the pin follows yevm-node's reth rev (currently `46731e9`) and only
+  so the pin follows yevm-node's reth rev (currently v2.11.0, `b9abbcc`) and only
   moves forward with it.
 - **D8 — Path-directed multiproofs ride reth's RPC server, not the feed.**
   Resolving a partial trie's stubs (mpt-lab PTRIE.md §8) needs proofs for

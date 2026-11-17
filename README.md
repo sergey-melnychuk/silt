@@ -13,8 +13,8 @@ is drop-to-cold (v0). See `PLAN.md` for the full design and milestones,
 | Crate | What | reth? |
 |---|---|---|
 | `silt-wire` | wire types, postcard codec, framing, handshake; the binary lookup + proof layout (`lookup`) | no |
-| `silt-node` | library any reth node installs: the feed ExEx + TCP publisher, lookup + proof server, `silt_multiproof` RPC | pinned `46731e9` (2.10.1-dev) |
-| `silt-exex` | thin binary: stock reth with silt-node installed | pinned `46731e9` (2.10.1-dev) |
+| `silt-node` | library any reth node installs: the feed ExEx + TCP publisher, lookup + proof server, `silt_multiproof` RPC | pinned v2.11.0 (`b9abbcc`) |
+| `silt-exex` | thin binary: stock reth with silt-node installed | pinned v2.11.0 (`b9abbcc`) |
 | `silt-cache` | subscriber, cache, lookup client, RPC fallback, Chain-shaped API (+ optional `yevm` adapter) | no |
 
 ## Run
@@ -129,7 +129,7 @@ let handle = builder
 
 The host must build against the same reth as silt (the workspace pin): one
 binary can't link two reth versions. silt pins yevm-node's reth rev
-(`46731e9`) and its `[patch]` set, so yevm-node can depend on silt-node
+(v2.11.0, `b9abbcc`) and its `[patch]` set, so yevm-node can depend on silt-node
 as-is. `run_exex` needs Ethereum primitives
 and `ChainSpec` (`NodeTypes<Primitives = EthPrimitives, ChainSpec =
 ChainSpec>`); the lookup server only needs the node's provider.
@@ -225,8 +225,9 @@ Per-version notes:
   incompatible dependency versions.
 - 2.8.1 -> 2.10.0: reth now patches evm2 and the reth-core crates (mirrored
   in the root `Cargo.toml`). `alloy-trie` is pinned to 0.9.8 — 0.9.9 breaks
-  reth-trie-common, and a bare `cargo update` undoes the pin. revm is gone:
-  bundle types moved to `reth_ethereum::trie::bundle_state`.
+  reth-trie-common, and a bare `cargo update` undoes the pin (until
+  v2.11.0, which requires 0.9.9). revm is gone: bundle types moved to
+  `reth_ethereum::trie::bundle_state`.
 - 2.10.0 -> 2.10.1: tag bump only. reth's evm2 patch moved from
   `DaniPopes/evm2` to `www.github.com/alloy-rs/evm2` at rev `01df8f6`
   (mirrored); reth-core patches unchanged; no crates.io version moved in
@@ -238,3 +239,11 @@ Per-version notes:
   dependency versions (discv5 0.12, enr 0.14, ed25519-dalek 3, aes-gcm
   0.11); `alloy-trie` stays 0.9.8. Bundle types moved into evm2 but reth
   still re-exports them as `reth_ethereum::trie::bundle_state`.
+- `46731e9` -> v2.11.0 (`b9abbcc`, 59 commits on; yevm-node's pin): rev
+  bump. reth's evm2 patch moves to rev `66687c1` (mirrored); reth-core
+  patches unchanged. `alloy-trie` must now be 0.9.9 (reth sets its new
+  field): `cargo update -p alloy-trie --precise 0.9.9`; `schnellru` gives
+  way to `similar`. No storage-format change (`DB_VERSION` 2, tables,
+  `NIPPY_JAR_VERSION` 1 and the codecs pin unchanged), so 2.10 binaries can
+  still open the datadir. reth's `eth_getProof` now caps storage keys at
+  1,024; silt's op 4 and `silt_multiproof` keep their own limits.

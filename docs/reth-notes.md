@@ -1,22 +1,27 @@
-# reth 46731e9 (2.10.1-dev) ExEx API notes (T1.0 VERIFY)
+# reth v2.11.0 ExEx API notes (T1.0 VERIFY)
 
-Verified against the pinned rev source: reth main `46731e9` (crates say
-2.10.1), the exact rev yevm-node pins and the target node runs. It is 35
-commits past where the `v2.10.1` tag (`58ebce1`) branched off. File
-references are into that rev. (Originally verified at v2.5.1; re-verified
-line-by-line after the 2.8.1, 2.10.0, 2.10.1 and `46731e9` bumps. For
-`46731e9` every reth file cited below was diffed against `v2.10.1`: only
-`blockchain_provider.rs` moved (lines re-cited), and the bundle-state
-types moved into evm2 behind the same re-export path — see `BundleState`.)
+Verified against the pinned rev source: the reth `v2.11.0` tag (`b9abbcc`),
+the rev yevm-node pins. File references are into that rev. (Originally
+verified at v2.5.1; re-verified line-by-line after the 2.8.1, 2.10.0,
+2.10.1, `46731e9` and v2.11.0 bumps. `46731e9` was 35 commits past where
+the `v2.10.1` tag branched off; v2.11.0 is 59 commits past `46731e9`, which
+it contains. For v2.11.0 every reth file cited below was diffed against
+`46731e9`: the storage-overlay provider moved 13 lines (re-cited; the
+changes are metrics plumbing and an optional trie-overlay cache), the RPC
+constants moved (re-cited; new `eth_getProof`/multiproof caps, see
+`eth_getProof` below), and `hash_builder/state.rs` now sets alloy-trie
+0.9.9's new field. The other changes in cited files don't touch the cited
+items. No storage-format change in between: `DB_VERSION` 2, the `db-api`
+tables, `NIPPY_JAR_VERSION` 1 and the reth-core codecs pin are unchanged.)
 
-- **Dependency**: `reth-ethereum = { git, rev = "46731e9…", features = ["full", "cli"] }`
+- **Dependency**: `reth-ethereum = { git, rev = "b9abbcc…", features = ["full", "cli"] }`
   — the in-repo `examples/exex-subscription` uses exactly this and exercises
   both the CLI wrapper and the ExEx (its `Cargo.toml:13`).
-- **Patches (new in 2.10)**: reth's root `Cargo.toml:672-683` `[patch]`es
+- **Patches (new in 2.10)**: reth's root `Cargo.toml:675-684` `[patch]`es
   evm2 (2.10.0: the pre-transfer `DaniPopes/evm2` URL; v2.10.1:
   `www.github.com/alloy-rs/evm2` at rev `01df8f6`; `46731e9`: back to
-  `DaniPopes/evm2` at rev `37fb326`, the same patches yevm's root
-  `Cargo.toml` carries) and the
+  `DaniPopes/evm2` at rev `37fb326`; v2.11.0: the same fork at `66687c1`,
+  the same patches yevm's root `Cargo.toml` carries) and the
   `reth-core` crates (`reth-codecs{,-derive}`, `reth-primitives-traits`,
   `reth-rpc-traits`, `reth-zstd-compressors` → `paradigmxyz/reth-core` git
   rev). Cargo ignores a dependency's patches, so silt's root `Cargo.toml`
@@ -24,11 +29,12 @@ types moved into evm2 behind the same re-export path — see `BundleState`.)
   still on revm) and `reth-trie-common` fails with `Account:
   From<&evm2::AccountInfo>` not satisfied. The `evm2-jit` patch (and, at
   v2.10.1, `inkwell`) is skipped: evm2-jit is not in silt's tree.
-- **alloy-trie must stay at 0.9.8** (reth's lock): 0.9.9 adds a pub
-  `HashBuilder::all_branch_nodes` field that reth-trie-common's struct
-  literal (`crates/trie/common/src/hash_builder/state.rs:32`) doesn't set.
-  A bare `cargo update` re-breaks this; re-pin with
-  `cargo update -p alloy-trie --precise 0.9.8`.
+- **alloy-trie must be 0.9.9 since v2.11.0** (reth's lock; #28367).
+  0.9.9 added a pub `HashBuilder::all_branch_nodes` field; up to `46731e9`
+  reth-trie-common's struct literal didn't set it, so 0.9.8 was required.
+  v2.11.0 sets it (`crates/trie/common/src/hash_builder/state.rs`), so 0.9.8
+  no longer builds. After a reth bump the old lock pin conflicts; resolve
+  with `cargo update -p alloy-trie --precise 0.9.9`.
 - **Wrapper pattern** (`examples/exex-subscription/src/main.rs:171`):
   `reth_ethereum::cli::Cli::parse_args().run(async |builder, _| { builder
   .node(EthereumNode::default()).install_exex("name", async |ctx|
@@ -119,8 +125,8 @@ types moved into evm2 behind the same re-export path — see `BundleState`.)
   served by `OverlayStateProvider` from the new `reth-storage-overlay`
   crate, wired via `OverlayStateProviderFactory` in
   `crates/storage/provider/src/providers/blockchain_provider.rs`
-  (`state_by_block_hash`, `:819`). Its `multiproof`
-  (`crates/storage/storage-overlay/src/provider.rs:752`) builds a revert
+  (`state_by_block_hash`, `:844`). Its `multiproof`
+  (`crates/storage/storage-overlay/src/provider.rs:765`) builds a revert
   overlay (`build_overlay`, `:352`) before walking — cost still grows
   with distance from tip.
 - **`MultiProof` has no serde** (`proofs.rs:183` derives only
@@ -138,7 +144,10 @@ read-only harness `silt-node/examples/lookup-ro.rs`; unchanged at `v2.10.1`
 (`58ebce1`) and re-cited at `46731e9`: only `blockchain_provider.rs` moved,
 by a new `get_prune_checkpoints_for_availability` at `:725` (`latest()`
 `:739`→`:745`, `state_by_block_hash()` `:813`→`:819`), and evm2's
-`Bytecode::original_bytes` moved `:352`→`:386` with an identical body.
+`Bytecode::original_bytes` moved `:352`→`:386` with an identical body. Re-cited at v2.11.0: `blockchain_provider.rs` moved
+another 25 lines (`latest()` `:770`, `state_by_block_hash()` `:844`) and
+the overlay builder 15 (`database_state_frontiers` `:755`); the cited
+behavior is unchanged.
 
 - **Provider from the ExEx**: `ExExContext::provider() -> &Node::Provider`
   (`crates/exex/exex/src/context.rs:82`); `Node::Provider: FullProvider`
@@ -154,10 +163,10 @@ by a new `get_prune_checkpoints_for_availability` at `:725` (`latest()`
   `BlockHashReader::block_hash(number)` (`block_hash.rs:11`).
 - **`BlockchainProvider` (the node's provider) resolution order**
   (`crates/storage/provider/src/providers/blockchain_provider.rs`):
-  `latest()` (`:745`) uses `canonical_in_memory_state.head_state()` — the
+  `latest()` (`:770`) uses `canonical_in_memory_state.head_state()` — the
   canonical head **including executed-but-unpersisted blocks** — else the
   DB; `chain_info()` (`:470`) reads the same in-memory head.
-  `state_by_block_hash()` (`:819`) tries canonical in-memory blocks, then
+  `state_by_block_hash()` (`:844`) tries canonical in-memory blocks, then
   `history_by_block_hash()` (DB; canonical only), then
   `pending_state_by_hash()`, else `StateForHashNotFound`. The pending block
   is set by the engine on `newPayload` before it is canonical
@@ -176,7 +185,7 @@ by a new `get_prune_checkpoints_for_availability` at `:725` (`latest()`
   wrapping evm2's; `original_bytes()` (evm2
   `crates/evm2/src/bytecode/mod.rs:386` at rev `37fb326`) is the unpadded code as a cheap
   `Bytes` clone. The overlay's `bytecode_by_hash` is not pinned by block
-  (`crates/storage/storage-overlay/src/provider.rs:580`): code is global
+  (`crates/storage/storage-overlay/src/provider.rs:593`): code is global
   per hash.
 - **How unknown / pruned / not-readable blocks surface**
   (`crates/storage/errors/src/provider.rs`): `BlockHashNotFound` (`:37`),
@@ -185,7 +194,7 @@ by a new `get_prune_checkpoints_for_availability` at `:725` (`latest()`
   `StateAtBlockPruned` (`:102`), `BlockNotExecuted` (`:105`),
   `InsufficientChangesets` (`:170`) — all mapped to `UnknownBlock`. Two
   traps: (1) the overlay is built **lazily on the first read**
-  (`execution_overlay`, `storage-overlay/src/provider.rs:386`), so
+  (`execution_overlay`, `storage-overlay/src/provider.rs:399`), so
   `StateAtBlockPruned` (`:419,428`) can come from `basic_account`/`storage`,
   not from opening — the server classifies item-read errors the same way
   and turns any block-level error into a frame-level `UnknownBlock`;
@@ -202,7 +211,8 @@ by a new `get_prune_checkpoints_for_availability` at `:725` (`latest()`
   monitored mode). `RayonConfig` (`crates/tasks/src/runtime.rs:101`) has
   exactly the ten fields yevm-reth's `minimal_runtime()` sets;
   `RuntimeConfig::with_tokio` (`:248`). v2.10.0 and v2.10.1 readers opened
-  the `46731e9` datadir without complaint; silt now pins that exact rev.
+  the `46731e9` datadir without complaint. v2.11.0 changes no storage
+  format (see the top), so the same holds for it.
 - **RocksDB secondary writes into the datadir**: a read-only RocksDB is a
   *secondary* instance whose scratch dir is
   `rocksdb_dir.parent()/rocksdb-secondary-tmp-<pid>`
@@ -224,7 +234,7 @@ by a new `get_prune_checkpoints_for_availability` at `:725` (`latest()`
   (`crates/stages/types/src/checkpoints.rs:491,498`) on
   `StageId::Finish` (`crates/stages/types/src/id.rs:33`), falling back to
   the Finish block — the same rule the overlay uses
-  (`database_state_frontiers`, `storage-overlay/src/builder.rs:740`).
+  (`database_state_frontiers`, `storage-overlay/src/builder.rs:755`).
   `StageId` is not re-exported by `reth-ethereum`, hence the direct
   `reth-stages-types` dependency (same tag, already in the tree).
 - **Cost note (harness only)**: a pin below the persisted tip resolves to
@@ -236,7 +246,7 @@ by a new `get_prune_checkpoints_for_availability` at `:725` (`latest()`
 
 ## Proof op facts (T5 VERIFY, D10)
 
-Verified at `46731e9` for op `Proof = 4` (`silt-node/src/lookup.rs`:
+Verified at `46731e9`, re-checked at v2.11.0, for op `Proof = 4` (`silt-node/src/lookup.rs`:
 `RethView::proof`, `write_multiproof`) and `examples/proof-bench.rs`.
 
 - **The read**: `StateProofProvider::multiproof(&self, TrieInput,
@@ -248,7 +258,7 @@ Verified at `46731e9` for op `Proof = 4` (`silt-node/src/lookup.rs`:
   subtree, branch_node_masks }` (`:689`). Op 4 carries `account_subtree`
   and each storage trie's `root` + `subtree`; the masks are dropped, as in
   D8. `multiproof_v2` (`trie.rs:174`) is left for later.
-- **On the overlay provider** (`crates/storage/storage-overlay/src/provider.rs:752`)
+- **On the overlay provider** (`crates/storage/storage-overlay/src/provider.rs:765`)
   it builds the revert overlay (`build_overlay`, `:352`), then runs one
   sequential `DbProof::overlay_multiproof` on the view's own read
   transaction. It uses no rayon pool, so the harness's one-thread
@@ -273,8 +283,12 @@ Verified at `46731e9` for op `Proof = 4` (`silt-node/src/lookup.rs`:
   stops MDBX reusing freed pages.
 - **`eth_getProof`** on a default node answers only the latest block:
   `--rpc.eth-proof-window` defaults to `DEFAULT_ETH_PROOF_WINDOW = 0`
-  (`crates/rpc/rpc-server-types/src/constants.rs:62`). So the verify
-  waits for the lookup server to reach the node's head.
+  (`crates/rpc/rpc-server-types/src/constants.rs:78`). So the verify
+  waits for the lookup server to reach the node's head. Since v2.11.0 it
+  (and reth's multiproof RPC) also takes at most `DEFAULT_MAX_PROOF_SLOTS =
+  1024` storage keys (`constants.rs:75`). silt's own proof paths are not
+  reth's handlers and keep their own limits: op 4 `MAX_PROOF_SLOTS` (4096)
+  and `silt_multiproof`.
 - **Changesets keep plain keys** in both storage layouts (v1 MDBX and v2
   static files; reth's own tests assert it at
   `crates/storage/provider/src/providers/database/provider.rs:5826,6022`).

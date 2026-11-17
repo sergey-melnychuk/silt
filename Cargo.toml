@@ -16,13 +16,13 @@ silt-node = { path = "crates/silt-node" }
 
 # The one reth pin (PLAN D4/D7), used only by silt-node and silt-exex. A
 # host node that installs silt-node must build against the same reth, so
-# this follows yevm-node's pin (yevm-reth/Cargo.toml): a reth main rev
-# after v2.10.1 (crates still say 2.10.1). It only moves forward with yevm.
+# this follows yevm-node's pin (yevm-reth/Cargo.toml): the v2.11.0 tag
+# (`b9abbcc`). It only moves forward with yevm.
 # Bumping: README "Upgrades" (mirror reth's `[patch]` below, lock pins).
-reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "46731e939ea81a31fe468378f5344657640da36b" }
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "b9abbcc1b982755baa9021e6874e2e58936ca65f" }
 # `StageId::Finish` for the read-only harness's state frontier (D9); in
 # reth's tree at the same rev, not re-exported by reth-ethereum.
-reth-stages-types = { git = "https://github.com/paradigmxyz/reth", rev = "46731e939ea81a31fe468378f5344657640da36b", default-features = false }
+reth-stages-types = { git = "https://github.com/paradigmxyz/reth", rev = "b9abbcc1b982755baa9021e6874e2e58936ca65f", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
@@ -43,14 +43,14 @@ yevm = { git = "https://github.com/sergey-melnychuk/yevm.git", branch = "main" }
 mpt-core = { git = "https://github.com/sergey-melnychuk/mpt-lab.git", rev = "e742acc96cc29d5b60f3fd51cbc86eb2a5b969fc" }
 rlp = "0.6"
 
-# Mirrors the `[patch]` section of reth 46731e9's root Cargo.toml (same as
+# Mirrors the `[patch]` section of reth v2.11.0's root Cargo.toml (same as
 # yevm's root Cargo.toml): Cargo ignores a dependency's patches, and without
 # these reth-core resolves from crates.io and reth-trie-common fails to
 # build. Re-sync on every reth bump. (reth's `evm2-jit` patch is left out:
 # silt doesn't build it, so Cargo would warn "patch not used".)
 [patch."https://github.com/alloy-rs/evm2"]
-evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "37fb326b91a76dd07308c703b3f3c85152a6230b" }
-evm2-inspectors = { git = "https://github.com/DaniPopes/evm2", rev = "37fb326b91a76dd07308c703b3f3c85152a6230b" }
+evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+evm2-inspectors = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
 
 [patch.crates-io]
 reth-codecs = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
