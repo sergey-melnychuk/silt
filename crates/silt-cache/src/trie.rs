@@ -29,9 +29,15 @@
 //! unusable (the traversal takes the root apart as it goes); the trie then
 //! drops to cold and [`WarmTrie::apply`] returns the error. Seed it again
 //! from a header's state root ([`WarmTrie::seed`]).
+//!
+//! **Reorgs (PLAN D12).** Every diff journals the leaves it replaced and
+//! the root it started from; [`WarmTrie::rollback`] re-applies the old
+//! leaves newest-first and checks the root it lands on. Nodes the undo
+//! needs and doesn't hold are fetched pinned at the fork block: they are
+//! content-addressed, so any node unchanged since the fork verifies.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use mpt_core::Keccak256;
@@ -132,6 +138,10 @@ pub struct WarmTrieConfig {
     pub keep_depth: usize,
     /// Storage tries untouched for this many blocks are dropped.
     pub storage_ttl: u64,
+    /// Blocks of undo journal for [`WarmTrie::rollback`] (PLAN D12),
+    /// capped at `storage_ttl` so an undo never needs a dropped storage
+    /// trie. `0` = no journal.
+    pub reorg_depth: usize,
 }
 
 impl Default for WarmTrieConfig {
@@ -140,6 +150,7 @@ impl Default for WarmTrieConfig {
             max_nodes: 250_000,
             keep_depth: 4,
             storage_ttl: 64,
+            reorg_depth: crate::store::DEFAULT_REORG_DEPTH,
         }
     }
 }
@@ -154,8 +165,10 @@ pub struct TrieStats {
     pub fetched_nodes: u64,
     pub fetched_bytes: u64,
     pub prunes: u64,
-    /// Drops to cold after a failed update.
+    /// Drops to cold after a failed update or rollback.
     pub resets: u64,
+    /// Reorgs undone by [`WarmTrie::rollback`].
+    pub rollbacks: u64,
     /// Revealed nodes and storage tries after the last apply.
     pub nodes: usize,
     pub storage_tries: usize,
@@ -169,7 +182,31 @@ pub struct WarmTrie {
     storages: HashMap<Word, (Trie<K>, u64)>,
     /// The block the trie is at: (number, hash).
     at: Option<(u64, Word)>,
+    /// The state root at `at` (the last apply's, or the seed's).
+    root_at: Word,
+    /// Undo records of the last diffs applied, oldest first (D12).
+    journal: VecDeque<TrieUndoBlock>,
     stats: TrieStats,
+}
+
+/// A leaf (or storage trie) one diff replaced.
+enum TrieUndo {
+    /// The account leaf before; `None` = absent.
+    Account(Word, Option<Vec<u8>>),
+    /// The slot's RLP value before, in the storage trie of the hashed
+    /// address; `None` = absent.
+    Slot(Word, Word, Option<Vec<u8>>),
+    /// A storage trie dropped with its destroyed account.
+    Storage(Word, (Trie<K>, u64)),
+}
+
+struct TrieUndoBlock {
+    /// The block and root the diff was applied on.
+    prev: (u64, Word),
+    prev_root: Word,
+    number: u64,
+    /// In the order applied; undone in reverse.
+    ops: Vec<TrieUndo>,
 }
 
 struct Leaf {
@@ -319,6 +356,8 @@ impl WarmTrie {
             state: Trie::new(),
             storages: HashMap::new(),
             at: None,
+            root_at: empty_root(),
+            journal: VecDeque::new(),
             stats: TrieStats::default(),
         }
     }
@@ -329,6 +368,8 @@ impl WarmTrie {
         self.state = trie_at(&state_root);
         self.storages.clear();
         self.at = Some((number, hash));
+        self.root_at = state_root;
+        self.journal.clear();
     }
 
     /// The block the trie is at, or `None` when cold.
@@ -348,7 +389,113 @@ impl WarmTrie {
         self.state = Trie::new();
         self.storages.clear();
         self.at = None;
+        self.journal.clear();
         self.stats.resets += 1;
+    }
+
+    fn journal_depth(&self) -> usize {
+        self.cfg
+            .reorg_depth
+            .min(usize::try_from(self.cfg.storage_ttl).unwrap_or(usize::MAX))
+    }
+
+    /// Rolls the trie back to the fork block (PLAN D12): re-applies, newest
+    /// first, the leaves every diff above it replaced, and returns the root
+    /// it lands on, which must equal the root the trie had at the fork.
+    /// Errs, leaving the trie as it was, if the journal doesn't reach back
+    /// to a diff applied right on the fork; errs and drops to cold if the
+    /// undo needs a node it can't get (e.g. pruned since) or lands on
+    /// another root. Either way, reseed from the fork's header. A trie
+    /// already at the fork returns its root. Needs a multi-threaded tokio
+    /// runtime, like [`WarmTrie::apply`].
+    pub async fn rollback(&mut self, fork_number: u64, fork_hash: Word) -> eyre::Result<Word> {
+        let (at, _) = self
+            .at
+            .ok_or_else(|| eyre::eyre!("cold: nothing to roll back"))?;
+        if self.at == Some((fork_number, fork_hash)) {
+            return Ok(self.root_at);
+        }
+        let above = self
+            .journal
+            .iter()
+            .rev()
+            .take_while(|b| b.number > fork_number)
+            .count();
+        let oldest = self.journal.len() - above;
+        let want = match self.journal.get(oldest) {
+            Some(b) if at > fork_number && b.prev == (fork_number, fork_hash) => b.prev_root,
+            _ => eyre::bail!("the journal doesn't reach back to block {fork_number}"),
+        };
+        let undone: Vec<TrieUndoBlock> = self.journal.drain(oldest..).collect();
+        let source = self.source.clone();
+        let fetcher = Fetcher {
+            source: &*source,
+            pin: fork_hash,
+            handle: tokio::runtime::Handle::current(),
+            nodes: RefCell::new(HashMap::new()),
+            probes: Cell::new(0),
+            fetched: Cell::new((0, 0)),
+        };
+        let result = self.undo(&fetcher, undone);
+        let (n, bytes) = fetcher.fetched.get();
+        self.stats.fetched_nodes += n;
+        self.stats.fetched_bytes += bytes;
+        self.stats.probes += fetcher.probes.get();
+        drop(fetcher);
+        let root = match result {
+            Ok(()) => self.root(),
+            Err(e) => {
+                self.reset();
+                return Err(e);
+            }
+        };
+        if root != want {
+            self.reset();
+            eyre::bail!(
+                "rollback to {fork_number} landed on {}, not {}",
+                hex(&root),
+                hex(&want)
+            );
+        }
+        self.at = Some((fork_number, fork_hash));
+        self.root_at = root;
+        self.stats.rollbacks += 1;
+        Ok(root)
+    }
+
+    fn undo(&mut self, f: &Fetcher<'_>, blocks: Vec<TrieUndoBlock>) -> eyre::Result<()> {
+        let accounts = View { f, owner: None };
+        for block in blocks.into_iter().rev() {
+            for op in block.ops.into_iter().rev() {
+                match op {
+                    TrieUndo::Account(ha, Some(leaf)) => self
+                        .state
+                        .insert_with(&accounts, &ha, leaf)
+                        .map_err(|e| trie_err("undo account", e))?,
+                    TrieUndo::Account(ha, None) => {
+                        self.state
+                            .remove_with(&accounts, &ha)
+                            .map_err(|e| trie_err("undo account", e))?;
+                    }
+                    TrieUndo::Slot(ha, hs, value) => {
+                        let (storage, _) = self
+                            .storages
+                            .get_mut(&ha)
+                            .ok_or_else(|| eyre::eyre!("undo: storage trie {} gone", hex(&ha)))?;
+                        let view = View { f, owner: Some(ha) };
+                        match value {
+                            Some(v) => storage.insert_with(&view, &hs, v),
+                            None => storage.remove_with(&view, &hs).map(|_| ()),
+                        }
+                        .map_err(|e| trie_err("undo slot", e))?;
+                    }
+                    TrieUndo::Storage(ha, trie) => {
+                        self.storages.insert(ha, trie);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Applies `diff` and returns the new state root. The diff must
@@ -399,7 +546,8 @@ impl WarmTrie {
             fetched: Cell::new((0, 0)),
         };
         fetcher.add(batch);
-        let result = self.update(diff.number, &fetcher, &touched, &changes, &writes);
+        let mut ops = Vec::new();
+        let result = self.update(diff.number, &fetcher, &touched, &changes, &writes, &mut ops);
         let (n, bytes) = fetcher.fetched.get();
         self.stats.fetched_nodes += n;
         self.stats.fetched_bytes += bytes;
@@ -409,10 +557,22 @@ impl WarmTrie {
             self.reset();
             return Err(e);
         }
+        if self.journal_depth() > 0 {
+            self.journal.push_back(TrieUndoBlock {
+                prev: (at, pin),
+                prev_root: self.root_at,
+                number: diff.number,
+                ops,
+            });
+            while self.journal.len() > self.journal_depth() {
+                self.journal.pop_front();
+            }
+        }
         self.at = Some((diff.number, diff.hash));
         self.stats.applied += 1;
         self.maybe_prune(diff.number);
-        Ok(self.root())
+        self.root_at = self.root();
+        Ok(self.root_at)
     }
 
     /// The diff's keys whose paths end in a stub: accounts (with all their
@@ -479,15 +639,24 @@ impl WarmTrie {
         touched: &BTreeSet<Addr>,
         changes: &BTreeMap<Addr, Option<AccountChange>>,
         writes: &BTreeMap<Addr, Vec<(Word, Word)>>,
+        ops: &mut Vec<TrieUndo>,
     ) -> eyre::Result<()> {
         let accounts = View { f, owner: None };
         for (addr, change) in changes {
             if change.is_none() {
                 let ha = keccak(addr);
+                let prior = self
+                    .state
+                    .get_with(&accounts, &ha)
+                    .map_err(|e| trie_err("read account", e))?
+                    .map(<[u8]>::to_vec);
                 self.state
                     .remove_with(&accounts, &ha)
                     .map_err(|e| trie_err("remove account", e))?;
-                self.storages.remove(&ha);
+                ops.push(TrieUndo::Account(ha, prior));
+                if let Some(storage) = self.storages.remove(&ha) {
+                    ops.push(TrieUndo::Storage(ha, storage));
+                }
             }
         }
         for addr in touched {
@@ -496,12 +665,12 @@ impl WarmTrie {
                 continue;
             }
             let ha = keccak(addr);
-            let prior = self
+            let prior_leaf = self
                 .state
                 .get_with(&accounts, &ha)
                 .map_err(|e| trie_err("read account", e))?
                 .map(<[u8]>::to_vec);
-            let prior = prior.as_deref().map(decode_leaf).transpose()?;
+            let prior = prior_leaf.as_deref().map(decode_leaf).transpose()?;
 
             // Storage first: the leaf needs the new root.
             let storage_root = match writes.get(addr) {
@@ -515,6 +684,11 @@ impl WarmTrie {
                     let view = View { f, owner: Some(ha) };
                     for (slot, value) in w {
                         let hs = keccak(slot);
+                        let before = storage
+                            .get_with(&view, &hs)
+                            .map_err(|e| trie_err("read slot", e))?
+                            .map(<[u8]>::to_vec);
+                        ops.push(TrieUndo::Slot(ha, hs, before));
                         let value = trim(value);
                         if value.is_empty() {
                             storage.remove_with(&view, &hs)
@@ -553,6 +727,7 @@ impl WarmTrie {
                     encode_leaf(nonce, &balance, &storage_root, &code_hash),
                 )
                 .map_err(|e| trie_err("write account", e))?;
+            ops.push(TrieUndo::Account(ha, prior_leaf));
         }
         Ok(())
     }
@@ -863,6 +1038,7 @@ mod tests {
             max_nodes: 150,
             keep_depth: 1,
             storage_ttl: 3,
+            reorg_depth: 3,
         };
         let (warm, _) = follow(cfg, 30).await;
         assert!(warm.stats().prunes > 0, "the cap was hit");
@@ -889,6 +1065,143 @@ mod tests {
             warm.apply(&step(&world, 2, &mut rng).0).await.is_err(),
             "2 does not continue 0"
         );
+    }
+
+    /// Re-chains a generated diff onto `parent`, as block hash `hash`.
+    fn rechain(diff: &mut BlockDiff, hash: Word, parent: Word) {
+        diff.hash = hash;
+        diff.parent_hash = parent;
+        diff.heads[0].hash = hash;
+        diff.heads[0].parent_hash = parent;
+    }
+
+    /// Generates `len` blocks of side `tag` on top of block `fork` (hash
+    /// `parent`) of `world`, registering each block's snapshot with the
+    /// node. Returns the diffs with the full-trie root after each, and the
+    /// world at the side's tip.
+    fn side(
+        node: &Node,
+        world: &World,
+        (fork, parent): (u64, Word),
+        len: u64,
+        tag: u8,
+        rng: &mut Rng,
+    ) -> (Vec<(BlockDiff, Word)>, World) {
+        let (mut world, mut parent) = (world.clone(), parent);
+        let blocks = (fork + 1..=fork + len)
+            .map(|n| {
+                let (mut diff, next) = step(&world, n, rng);
+                let mut hash = block_hash(n);
+                hash[0] = tag;
+                rechain(&mut diff, hash, parent);
+                let full_next = full(&next);
+                let root = node_root(full_next.state.root());
+                node.snapshots.lock().unwrap().insert(hash, full_next);
+                (world, parent) = (next, hash);
+                (diff, root)
+            })
+            .collect();
+        (blocks, world)
+    }
+
+    /// D12: following side A, rolling back to the fork, then following side
+    /// B gives B's exact roots; B then becomes the chain the next trial
+    /// extends. With heavy pruning a rollback may fail (the undo needs a
+    /// node changed and pruned since the fork), but it must never land on
+    /// a wrong root; a failed one reseeds at the fork.
+    async fn reorgs(cfg: WarmTrieConfig, trials: u64) -> TrieStats {
+        let mut rng = Rng(0x0511_d12d);
+        let mut world = genesis(&mut rng);
+        let node = Arc::new(Node::default());
+        let mut root = node_root(full(&world).state.root());
+        let mut tip = (0u64, block_hash(0));
+        node.snapshots.lock().unwrap().insert(tip.1, full(&world));
+        let mut warm = WarmTrie::new(node.clone(), cfg);
+        warm.seed(tip.0, tip.1, root);
+        for trial in 0..trials {
+            let (common, next) = side(&node, &world, tip, 1 + rng.below(3), 0xC0, &mut rng);
+            for (diff, want) in &common {
+                assert_eq!(
+                    warm.apply(diff).await.unwrap(),
+                    *want,
+                    "block {}",
+                    diff.number
+                );
+                (tip, root) = ((diff.number, diff.hash), *want);
+            }
+            world = next;
+            let (a, _) = side(&node, &world, tip, 1 + rng.below(3), 0xA0, &mut rng);
+            let (b, b_world) = side(&node, &world, tip, 1 + rng.below(3), 0xB0, &mut rng);
+            for (diff, want) in &a {
+                assert_eq!(
+                    warm.apply(diff).await.unwrap(),
+                    *want,
+                    "side A {}",
+                    diff.number
+                );
+            }
+            match warm.rollback(tip.0, tip.1).await {
+                Ok(got) => assert_eq!(got, root, "trial {trial}: root at the fork"),
+                Err(_) => warm.seed(tip.0, tip.1, root),
+            }
+            assert_eq!(warm.at(), Some(tip));
+            for (diff, want) in &b {
+                assert_eq!(
+                    warm.apply(diff).await.unwrap(),
+                    *want,
+                    "side B {}",
+                    diff.number
+                );
+                (tip, root) = ((diff.number, diff.hash), *want);
+            }
+            world = b_world;
+        }
+        warm.stats().clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_then_the_new_side_gives_exact_roots() {
+        let s = reorgs(WarmTrieConfig::default(), 12).await;
+        eprintln!("{s:?}");
+        assert_eq!(s.rollbacks, 12, "every rollback succeeds without pruning");
+        assert_eq!(s.resets, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_under_heavy_pruning_is_exact_or_refuses() {
+        let cfg = WarmTrieConfig {
+            max_nodes: 150,
+            keep_depth: 1,
+            storage_ttl: 8,
+            reorg_depth: 8,
+        };
+        let s = reorgs(cfg, 12).await;
+        eprintln!("{s:?}");
+        assert!(s.prunes > 0, "the cap was hit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_refuses_beyond_the_journal() {
+        let cfg = WarmTrieConfig {
+            reorg_depth: 2,
+            ..WarmTrieConfig::default()
+        };
+        let (mut warm, _) = follow(cfg, 5).await;
+        let root5 = warm.root();
+        assert!(warm.rollback(2, block_hash(2)).await.is_err());
+        assert_eq!(warm.at(), Some((5, block_hash(5))), "left as it was");
+        assert_eq!(warm.root(), root5);
+        assert!(
+            warm.rollback(3, [0x99; 32]).await.is_err(),
+            "wrong fork hash"
+        );
+        assert_eq!(
+            warm.rollback(5, block_hash(5)).await.unwrap(),
+            root5,
+            "at the fork"
+        );
+        assert!(warm.rollback(3, block_hash(3)).await.is_ok());
+        assert_eq!(warm.at(), Some((3, block_hash(3))));
     }
 
     #[test]

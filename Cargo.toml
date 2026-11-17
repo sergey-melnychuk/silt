@@ -58,3 +58,16 @@ reth-codecs-derive = { git = "https://github.com/paradigmxyz/reth-core", rev = "
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
 reth-rpc-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
 reth-zstd-compressors = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+
+# The warm-trie tests (silt-cache `trie`) build full tries for every block;
+# unoptimized, the trie and keccak code make them minutes long. These
+# versions are used only by mpt-core and silt-cache (reth uses keccak
+# 0.2), so this never invalidates a reth build.
+[profile.dev.package.mpt-core]
+opt-level = 3
+[profile.dev.package."sha3:0.10.9"]
+opt-level = 3
+[profile.dev.package."keccak:0.1.6"]
+opt-level = 3
+[profile.dev.package."rlp:0.6.1"]
+opt-level = 3

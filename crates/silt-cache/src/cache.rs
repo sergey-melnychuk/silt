@@ -29,6 +29,9 @@ pub struct CacheConfig {
     pub lookup_addr: Option<String>,
     /// Per-request lookup deadline before falling back to RPC.
     pub lookup_timeout: Duration,
+    /// Reorgs up to this many blocks deep roll back; deeper ones drop to
+    /// cold (PLAN D12). `0` = always drop to cold.
+    pub reorg_depth: usize,
 }
 
 impl CacheConfig {
@@ -40,6 +43,7 @@ impl CacheConfig {
             liveness: Duration::from_secs(30),
             lookup_addr: None,
             lookup_timeout: Duration::from_millis(500),
+            reorg_depth: crate::store::DEFAULT_REORG_DEPTH,
         }
     }
 
@@ -95,7 +99,7 @@ impl Cache {
         cfg: CacheConfig,
         fallback: Arc<dyn Fallback>,
     ) -> (Arc<Self>, UnboundedReceiver<HeadEvent>) {
-        let store = Arc::new(Store::new(256));
+        let store = Arc::new(Store::with_reorg_depth(256, cfg.reorg_depth));
         let (events_tx, events_rx) = unbounded_channel();
         let cache = Arc::new(Self {
             store: store.clone(),
@@ -144,18 +148,20 @@ impl Cache {
         self.store.tip()
     }
 
-    /// The block hash lazy reads pin to; before the first diff we pin to
-    /// the RPC's latest block (RPC-only / cold operation).
-    async fn pin(&self) -> eyre::Result<(u64, Word)> {
-        if let Some(tip) = self.store.tip() {
-            return Ok(tip);
+    /// The block lazy reads pin to, and the store epoch their fills must
+    /// land in (D12); before the first diff we pin to the RPC's latest
+    /// block (RPC-only / cold operation).
+    async fn pin(&self) -> eyre::Result<(u64, Word, u64)> {
+        let (tip, epoch) = self.store.tip_and_epoch();
+        if let Some((number, hash)) = tip {
+            return Ok((number, hash, epoch));
         }
         let head = self.fallback.head_by_number(None).await?;
-        Ok((head.number, head.hash))
+        Ok((head.number, head.hash, epoch))
     }
 
     pub async fn account(&self, addr: &Addr) -> eyre::Result<AccountView> {
-        let (now, pin_hash) = self.pin().await?;
+        let (now, pin_hash, epoch) = self.pin().await?;
         if let Some(entry) = self.store.account(addr, now) {
             let code = match self.store.code(&entry.code_hash) {
                 Some(code) => code,
@@ -206,8 +212,14 @@ impl Cache {
         };
         let code = Arc::new(fetched.code);
         self.store.insert_code(code_hash, code.clone());
-        self.store
-            .insert_lazy_account(*addr, fetched.balance, fetched.nonce, code_hash, now);
+        self.store.insert_lazy_account(
+            *addr,
+            fetched.balance,
+            fetched.nonce,
+            code_hash,
+            now,
+            epoch,
+        );
         self.flights.remove(&FlightKey::Account(*addr));
         Ok(AccountView {
             balance: fetched.balance,
@@ -218,7 +230,7 @@ impl Cache {
     }
 
     pub async fn storage(&self, addr: &Addr, slot: &Word) -> eyre::Result<Word> {
-        let (now, pin_hash) = self.pin().await?;
+        let (now, pin_hash, epoch) = self.pin().await?;
         if let Some(value) = self.store.slot(addr, slot, now) {
             return Ok(value);
         }
@@ -237,7 +249,7 @@ impl Cache {
             return Ok(value);
         }
         let value = self.fallback.storage_at(addr, slot, &pin_hash).await?;
-        self.store.insert_lazy_slot(*addr, *slot, value, now);
+        self.store.insert_lazy_slot(*addr, *slot, value, now, epoch);
         self.flights.remove(&FlightKey::Slot(*addr, *slot));
         Ok(value)
     }

@@ -7,6 +7,12 @@
 //!   if a diff touched the key first, the diff's value wins; this closes the
 //!   fetch/apply race without locks.
 //! - the provenance bit is recorded per entry (reserved for the layered v1).
+//!
+//! Reorgs (PLAN D12): every applied diff journals the entries it replaced,
+//! so [`Store::rollback`] can undo the blocks a reorg dropped instead of
+//! dropping the whole cache. Lazy fills carry the store's epoch from when
+//! their read was pinned; a rollback or clear bumps it, and a fill from an
+//! older epoch is discarded (it may have read a dropped block).
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -46,6 +52,39 @@ pub struct Stats {
     pub misses: AtomicU64,
     pub applied_blocks: AtomicU64,
     pub cold_drops: AtomicU64,
+    /// Reorgs undone by [`Store::rollback`], and the blocks they undid.
+    pub rollbacks: AtomicU64,
+    pub rolled_back_blocks: AtomicU64,
+}
+
+/// Blocks of undo journal kept by default: about mainnet finality, far
+/// beyond the one- or two-block reorgs it sees (PLAN D12).
+pub const DEFAULT_REORG_DEPTH: usize = 64;
+
+/// One entry an applied diff (or a lazy fill) replaced.
+#[derive(Debug)]
+enum Undo {
+    /// The account entry before; `None` = not held.
+    Account(Addr, Option<AccountEntry>),
+    /// The slot entry before; `None` = not held.
+    Slot(Addr, Word, Option<SlotEntry>),
+}
+
+#[derive(Debug)]
+struct BlockUndo {
+    /// The tip the diff was applied on; `None` = it seeded a cold store.
+    prev_tip: Option<(u64, Word)>,
+    number: u64,
+    /// In the order applied; undone in reverse.
+    ops: Vec<Undo>,
+}
+
+#[derive(Debug, Default)]
+struct Journal {
+    /// Bumped by every rollback and clear.
+    epoch: u64,
+    /// Oldest first; at most `reorg_depth` blocks.
+    blocks: VecDeque<BlockUndo>,
 }
 
 pub struct Store {
@@ -59,6 +98,10 @@ pub struct Store {
     tip: parking_lot_free::Mutex<Option<(u64, Word)>>,
     pub stats: Stats,
     heads_cap: usize,
+    /// Taken by `apply`, `rollback`, `clear` and lazy fills, before any
+    /// other lock in this struct.
+    journal: std::sync::Mutex<Journal>,
+    reorg_depth: usize,
 }
 
 /// std Mutex with a short alias (no parking_lot dependency).
@@ -68,6 +111,12 @@ mod parking_lot_free {
 
 impl Store {
     pub fn new(heads_cap: usize) -> Self {
+        Self::with_reorg_depth(heads_cap, DEFAULT_REORG_DEPTH)
+    }
+
+    /// A store that can roll back reorgs up to `reorg_depth` blocks deep;
+    /// `0` keeps no journal (every reorg drops to cold, as in D3).
+    pub fn with_reorg_depth(heads_cap: usize, reorg_depth: usize) -> Self {
         Self {
             accounts: DashMap::new(),
             storage: DashMap::new(),
@@ -77,7 +126,20 @@ impl Store {
             tip: parking_lot_free::Mutex::new(None),
             stats: Stats::default(),
             heads_cap,
+            journal: std::sync::Mutex::new(Journal::default()),
+            reorg_depth,
         }
+    }
+
+    /// The epoch a lazy read must be pinned in for its fill to land.
+    pub fn epoch(&self) -> u64 {
+        self.journal.lock().expect("journal lock").epoch
+    }
+
+    /// The tip and the epoch, read together: what a lazy read pins to.
+    pub fn tip_and_epoch(&self) -> (Option<(u64, Word)>, u64) {
+        let journal = self.journal.lock().expect("journal lock");
+        (self.tip(), journal.epoch)
     }
 
     pub fn tip(&self) -> Option<(u64, Word)> {
@@ -101,7 +163,10 @@ impl Store {
     /// Applies one validated diff. Caller has already checked chain
     /// continuity; this is pure upsert (PLAN §E apply semantics).
     pub fn apply(&self, diff: &BlockDiff) {
+        let mut journal = self.journal.lock().expect("journal lock");
+        let mut ops = Vec::new();
         for (hash, bytes) in &diff.code {
+            // Content-addressed: immune to reorgs, never journaled.
             self.code
                 .entry(*hash)
                 .or_insert_with(|| Arc::new(bytes.clone()));
@@ -110,15 +175,19 @@ impl Store {
             match change {
                 None => {
                     // Destroyed: the account and every slot we hold for it.
-                    self.accounts.remove(addr);
+                    if let Some((_, prev)) = self.accounts.remove(addr) {
+                        ops.push(Undo::Account(*addr, Some(prev)));
+                    }
                     if let Some((_, slots)) = self.slots_by_acc.remove(addr) {
                         for slot in slots {
-                            self.storage.remove(&(*addr, slot));
+                            if let Some((_, prev)) = self.storage.remove(&(*addr, slot)) {
+                                ops.push(Undo::Slot(*addr, slot, Some(prev)));
+                            }
                         }
                     }
                 }
                 Some(c) => {
-                    self.accounts.insert(
+                    let prev = self.accounts.insert(
                         *addr,
                         AccountEntry {
                             balance: c.balance,
@@ -128,11 +197,12 @@ impl Store {
                             last_read: Arc::new(AtomicU64::new(diff.number)),
                         },
                     );
+                    ops.push(Undo::Account(*addr, prev));
                 }
             }
         }
         for (addr, slot, value) in &diff.storage {
-            self.storage.insert(
+            let prev = self.storage.insert(
                 (*addr, *slot),
                 SlotEntry {
                     value: *value,
@@ -141,7 +211,9 @@ impl Store {
                 },
             );
             self.slots_by_acc.entry(*addr).or_default().insert(*slot);
+            ops.push(Undo::Slot(*addr, *slot, prev));
         }
+        let prev_tip = self.tip();
         {
             // A span overlapping the tip (client::Continuity::Overlaps)
             // repeats heads the ring already holds.
@@ -159,10 +231,92 @@ impl Store {
             }
         }
         *self.tip.lock().expect("tip lock") = Some((diff.number, diff.hash));
+        if self.reorg_depth > 0 {
+            journal.blocks.push_back(BlockUndo {
+                prev_tip,
+                number: diff.number,
+                ops,
+            });
+            while journal.blocks.len() > self.reorg_depth {
+                journal.blocks.pop_front();
+            }
+        }
         self.stats.applied_blocks.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Lazy fills never clobber (see module docs).
+    /// Rolls the store back to the fork block `(fork_number, fork_hash)`
+    /// (PLAN D12): undoes, newest first, every diff applied above it and
+    /// drops the heads above it. Succeeds only if the oldest diff above the
+    /// fork was applied right on that block (within the journal, on the
+    /// same chain); otherwise changes nothing and returns `false`, and the
+    /// caller drops to cold. A tip already at the fork is a no-op `true`.
+    pub fn rollback(&self, fork_number: u64, fork_hash: Word) -> bool {
+        let mut journal = self.journal.lock().expect("journal lock");
+        let Some((tip, tip_hash)) = self.tip() else {
+            return false;
+        };
+        if (tip, tip_hash) == (fork_number, fork_hash) {
+            return true;
+        }
+        if tip <= fork_number {
+            return false;
+        }
+        let above = journal
+            .blocks
+            .iter()
+            .rev()
+            .take_while(|b| b.number > fork_number)
+            .count();
+        let oldest = journal.blocks.len() - above;
+        match journal.blocks.get(oldest) {
+            Some(b) if b.prev_tip == Some((fork_number, fork_hash)) => {}
+            _ => return false,
+        }
+        let undone: Vec<BlockUndo> = journal.blocks.drain(oldest..).collect();
+        for block in undone.into_iter().rev() {
+            for op in block.ops.into_iter().rev() {
+                self.undo(op);
+            }
+        }
+        {
+            let mut heads = self.heads.lock().expect("heads lock");
+            while heads.back().is_some_and(|h| h.number > fork_number) {
+                heads.pop_back();
+            }
+        }
+        *self.tip.lock().expect("tip lock") = Some((fork_number, fork_hash));
+        journal.epoch += 1;
+        self.stats.rollbacks.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .rolled_back_blocks
+            .fetch_add(tip - fork_number, Ordering::Relaxed);
+        true
+    }
+
+    fn undo(&self, op: Undo) {
+        match op {
+            Undo::Account(addr, Some(prev)) => {
+                self.accounts.insert(addr, prev);
+            }
+            Undo::Account(addr, None) => {
+                self.accounts.remove(&addr);
+            }
+            Undo::Slot(addr, slot, Some(prev)) => {
+                self.storage.insert((addr, slot), prev);
+                self.slots_by_acc.entry(addr).or_default().insert(slot);
+            }
+            Undo::Slot(addr, slot, None) => {
+                self.storage.remove(&(addr, slot));
+                if let Some(mut set) = self.slots_by_acc.get_mut(&addr) {
+                    set.remove(&slot);
+                }
+            }
+        }
+    }
+
+    /// Lazy fills never clobber (see module docs), and land only in the
+    /// `epoch` their read was pinned in (from [`Store::tip_and_epoch`]).
+    /// Returns whether the entry was inserted.
     pub fn insert_lazy_account(
         &self,
         addr: Addr,
@@ -170,25 +324,59 @@ impl Store {
         nonce: u64,
         code_hash: Word,
         at_block: u64,
-    ) {
-        self.accounts.entry(addr).or_insert_with(|| AccountEntry {
-            balance,
-            nonce,
-            code_hash,
-            provenance: Provenance::Lazy,
-            last_read: Arc::new(AtomicU64::new(at_block)),
+        epoch: u64,
+    ) -> bool {
+        let mut journal = self.journal.lock().expect("journal lock");
+        if journal.epoch != epoch {
+            return false;
+        }
+        let mut inserted = false;
+        self.accounts.entry(addr).or_insert_with(|| {
+            inserted = true;
+            AccountEntry {
+                balance,
+                nonce,
+                code_hash,
+                provenance: Provenance::Lazy,
+                last_read: Arc::new(AtomicU64::new(at_block)),
+            }
         });
+        // A rollback past the current tip removes it: it may have been
+        // read at a block the rollback drops.
+        if inserted && let Some(block) = journal.blocks.back_mut() {
+            block.ops.push(Undo::Account(addr, None));
+        }
+        inserted
     }
 
-    pub fn insert_lazy_slot(&self, addr: Addr, slot: Word, value: Word, at_block: u64) {
-        self.storage
-            .entry((addr, slot))
-            .or_insert_with(|| SlotEntry {
+    pub fn insert_lazy_slot(
+        &self,
+        addr: Addr,
+        slot: Word,
+        value: Word,
+        at_block: u64,
+        epoch: u64,
+    ) -> bool {
+        let mut journal = self.journal.lock().expect("journal lock");
+        if journal.epoch != epoch {
+            return false;
+        }
+        let mut inserted = false;
+        self.storage.entry((addr, slot)).or_insert_with(|| {
+            inserted = true;
+            SlotEntry {
                 value,
                 provenance: Provenance::Lazy,
                 last_read: Arc::new(AtomicU64::new(at_block)),
-            });
-        self.slots_by_acc.entry(addr).or_default().insert(slot);
+            }
+        });
+        if inserted {
+            self.slots_by_acc.entry(addr).or_default().insert(slot);
+            if let Some(block) = journal.blocks.back_mut() {
+                block.ops.push(Undo::Slot(addr, slot, None));
+            }
+        }
+        inserted
     }
 
     pub fn insert_code(&self, hash: Word, bytes: Arc<Vec<u8>>) {
@@ -216,9 +404,12 @@ impl Store {
         self.code.get(hash).map(|c| c.clone())
     }
 
-    /// Drop-to-cold (D3): forget everything except nothing — the next diff
+    /// Drop-to-cold (D3): forget everything except code — the next diff
     /// or lazy read rebuilds.
     pub fn clear(&self) {
+        let mut journal = self.journal.lock().expect("journal lock");
+        journal.blocks.clear();
+        journal.epoch += 1;
         self.accounts.clear();
         self.storage.clear();
         self.slots_by_acc.clear();
@@ -329,10 +520,10 @@ mod tests {
         store.apply(&d);
         // A racing lazy fetch that resolved before the diff landed must not
         // overwrite the authoritative value.
-        store.insert_lazy_slot(addr, [5; 32], [6; 32], 0);
+        assert!(!store.insert_lazy_slot(addr, [5; 32], [6; 32], 0, store.epoch()));
         assert_eq!(store.slot(&addr, &[5; 32], 1), Some([7; 32]));
         // And diff always clobbers lazy:
-        store.insert_lazy_slot(addr, [9; 32], [1; 32], 1);
+        assert!(store.insert_lazy_slot(addr, [9; 32], [1; 32], 1, store.epoch()));
         let mut d2 = diff(2, 2, 1);
         d2.storage = vec![(addr, [9; 32], [2; 32])];
         store.apply(&d2);
@@ -370,5 +561,208 @@ mod tests {
         let evicted = store.evict(100, 64);
         assert_eq!(evicted, 1, "untouched slot evicted");
         assert!(store.slot(&addr, &[1; 32], 100).is_some());
+    }
+
+    /// Everything the store holds, for comparing two stores.
+    type Snapshot = (
+        std::collections::BTreeMap<Addr, (Word, u64, Word)>,
+        std::collections::BTreeMap<(Addr, Word), Word>,
+        Option<(u64, Word)>,
+        Vec<u64>,
+    );
+
+    fn snapshot(store: &Store) -> Snapshot {
+        let accounts = store
+            .accounts
+            .iter()
+            .map(|e| (*e.key(), (e.balance, e.nonce, e.code_hash)))
+            .collect();
+        let storage = store.storage.iter().map(|e| (*e.key(), e.value)).collect();
+        let heads = store
+            .heads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| h.number)
+            .collect();
+        // The slot index must name exactly the slots held.
+        for e in store.storage.iter() {
+            let (addr, slot) = e.key();
+            assert!(store.slots_by_acc.get(addr).unwrap().contains(slot));
+        }
+        (accounts, storage, store.tip(), heads)
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Block `number` of chain `side`: a few account writes, destroys and
+    /// slot writes over a small key space, so blocks collide on keys.
+    fn random_block(rng: &mut Rng, number: u64, side: u8, parent: Word) -> BlockDiff {
+        let hash = {
+            let mut h = [number as u8; 32];
+            h[1] = side;
+            h
+        };
+        let mut accounts = std::collections::BTreeMap::new();
+        for _ in 0..rng.below(6) {
+            let addr = [rng.below(8) as u8; 20];
+            let change = (rng.below(5) != 0).then(|| AccountChange {
+                balance: [rng.below(250) as u8; 32],
+                nonce: rng.below(100),
+                code_hash: [0; 32],
+            });
+            accounts.insert(addr, change);
+        }
+        let mut storage = std::collections::BTreeMap::new();
+        for _ in 0..rng.below(8) {
+            let addr = [rng.below(8) as u8; 20];
+            if matches!(accounts.get(&addr), Some(None)) {
+                continue; // a destroyed account's diff carries no slots
+            }
+            storage.insert((addr, [rng.below(6) as u8; 32]), [rng.below(250) as u8; 32]);
+        }
+        let mut head = head(number, 0, 0);
+        head.hash = hash;
+        head.parent_hash = parent;
+        BlockDiff {
+            span_start: number,
+            number,
+            hash,
+            parent_hash: parent,
+            heads: vec![head],
+            accounts: accounts.into_iter().collect(),
+            storage: storage.into_iter().map(|((a, k), v)| (a, k, v)).collect(),
+            code: vec![],
+            receipts: vec![],
+        }
+    }
+
+    /// D12: rolling back chain A to the fork and applying chain B leaves
+    /// the store exactly as if it had followed B, lazy fills included.
+    #[test]
+    fn rollback_then_new_side_equals_following_the_new_side() {
+        let mut rng = Rng(0x5117_d12d);
+        for trial in 0..300 {
+            let prefix = 1 + rng.below(4);
+            let (a_len, b_len) = (1 + rng.below(4), 1 + rng.below(4));
+            let mut chain = Vec::new();
+            let mut parent = [0; 32];
+            for n in 1..=prefix {
+                let d = random_block(&mut rng, n, 0, parent);
+                parent = d.hash;
+                chain.push(d);
+            }
+            let fork = (prefix, parent);
+            let side = |rng: &mut Rng, len: u64, tag: u8| {
+                let mut p = fork.1;
+                (prefix + 1..=prefix + len)
+                    .map(|n| {
+                        let d = random_block(rng, n, tag, p);
+                        p = d.hash;
+                        d
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let (a, b) = (side(&mut rng, a_len, 1), side(&mut rng, b_len, 2));
+            // Lazy fills of keys the prefix never wrote, on both stores.
+            let fills: Vec<(Addr, Word, Word)> = (0..rng.below(4))
+                .map(|i| ([0xF0 + i as u8; 20], [i as u8; 32], [7; 32]))
+                .collect();
+
+            let rolled = Store::new(16);
+            let direct = Store::new(16);
+            for d in &chain {
+                rolled.apply(d);
+                direct.apply(d);
+            }
+            for &(addr, slot, v) in &fills {
+                assert!(rolled.insert_lazy_slot(addr, slot, v, prefix, rolled.epoch()));
+                assert!(direct.insert_lazy_slot(addr, slot, v, prefix, direct.epoch()));
+            }
+            for (i, d) in a.iter().enumerate() {
+                rolled.apply(d);
+                // A fill read on chain A must not survive the rollback.
+                let epoch = rolled.epoch();
+                rolled.insert_lazy_slot([0xEE; 20], [i as u8; 32], [1; 32], d.number, epoch);
+            }
+            let stale_epoch = rolled.epoch();
+            assert!(rolled.rollback(fork.0, fork.1), "trial {trial}");
+            assert_eq!(
+                snapshot(&rolled),
+                snapshot(&direct),
+                "trial {trial} at fork"
+            );
+            assert!(
+                !rolled.insert_lazy_slot([0xEF; 20], [0; 32], [1; 32], 0, stale_epoch),
+                "a fill pinned before the rollback is discarded"
+            );
+            for d in &b {
+                rolled.apply(d);
+                direct.apply(d);
+            }
+            assert_eq!(
+                snapshot(&rolled),
+                snapshot(&direct),
+                "trial {trial} after B"
+            );
+            assert_eq!(rolled.stats.rollbacks.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn rollback_refuses_what_it_cannot_undo_exactly() {
+        let chain = |store: &Store, n: u64| {
+            for i in 1..=n {
+                store.apply(&diff(i, i as u8, i as u8 - 1));
+            }
+        };
+        // Deeper than the journal: unchanged, caller drops to cold.
+        let store = Store::with_reorg_depth(16, 2);
+        chain(&store, 4);
+        let before = snapshot(&store);
+        assert!(!store.rollback(1, [1; 32]));
+        assert_eq!(snapshot(&store), before);
+        assert!(store.rollback(2, [2; 32]), "within the journal");
+        assert_eq!(store.tip(), Some((2, [2; 32])));
+        assert!(store.head(3).is_none());
+
+        // Wrong fork hash, a fork above the tip, no journal at all.
+        let store = Store::new(16);
+        chain(&store, 3);
+        assert!(!store.rollback(1, [0x99; 32]));
+        assert!(!store.rollback(5, [5; 32]));
+        assert!(store.rollback(3, [3; 32]), "tip at the fork: no-op");
+        assert_eq!(store.stats.rollbacks.load(Ordering::Relaxed), 0);
+        let none = Store::with_reorg_depth(16, 0);
+        chain(&none, 3);
+        assert!(!none.rollback(2, [2; 32]));
+
+        // A folded span that straddles the fork can't be split.
+        let store = Store::new(16);
+        chain(&store, 1);
+        let mut span = diff(3, 3, 1);
+        span.span_start = 2;
+        span.heads = vec![head(2, 2, 1), head(3, 3, 2)];
+        store.apply(&span);
+        assert!(!store.rollback(2, [2; 32]));
+        assert!(store.rollback(1, [1; 32]));
+
+        // After a clear the journal is gone.
+        let store = Store::new(16);
+        chain(&store, 3);
+        store.clear();
+        store.apply(&diff(3, 3, 2));
+        assert!(!store.rollback(2, [2; 32]));
     }
 }
