@@ -171,15 +171,25 @@ ChainSpec>`); the lookup server only needs the node's provider.
   a `Cache` that holds the parent state (`Cache::from_store`: the tool
   feeds the store itself and applies diff N only after block N ran), and
   compares status, gas and created address with the node's receipts.
+  Live (2026-11-17): 20 mainnet blocks, 6,690 transactions, 0 mismatches,
+  0 errors; block replay p50 1.0 s with the store starting cold (max 14 s,
+  while `trie-follow` ran alongside).
 - D11 warm state trie (silt-cache feature `trie`): `WarmTrie` follows the
   diffs, recomputes the state root per block and fetches only unseen nodes
   over op 4 (a batch per diff plus path-directed probes); offline tests
   check every root against full tries over 40 random blocks, with and
-  without pruning. `trie-follow` checks it against live headers.
+  without pruning. `trie-follow` checks it against live headers. Live
+  (2026-11-17), seeded cold: 50 of 50 roots equal the mainnet headers;
+  apply p50 2.2 s (first block 11.6 s), still fetching 1–4 MB of nodes per
+  block at 170k revealed nodes, below the cap.
 - D6 cap: catch-up segments longer than `max_span` (default 32) blocks are
-  published as several diffs, each with only its own blocks' keys.
-- Pending live runs (PLAN M2/M3 gates): the replay check, `trie-follow`, the wrapper
-  kill/catch-up test under load, and the 24 h live-node equivalence soak.
+  published as several diffs, each with only its own blocks' keys. In the
+  node (2026-11-16): catching up ~45 blocks after a restart took spans of
+  2–17 blocks, and the diff stream ran on across the restart with no gap
+  or overlap; over the next 24 h, 7,241 diffs, the longest 17 blocks.
+- Pending live runs (PLAN M3 gates): the 24 h live-node equivalence soak
+  (running since 2026-11-17 13:53 UTC) and the wrapper kill/catch-up test
+  under load.
 
 Feed and lookup security model (PLAN D1): no auth/TLS — bind to localhost
 or a private network only.
