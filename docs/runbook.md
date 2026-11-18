@@ -195,6 +195,7 @@ Gates before deploying:
   reconnects, gaps, breaks, latency (block timestamp to diff received,
   about 3 s p50 on mainnet), bytes per block (about 280 KB, about 2 GB a
   day), and its own memory.
+- **Consumers:** silt-cache's `over its soft memory limit` WARN (§11).
 
 ## 10. Known limits
 
@@ -209,3 +210,52 @@ Gates before deploying:
 - Proofs deeper than `lookup_proof_max_depth` (8) below the head answer
   `UnknownBlock`. Each block of depth costs reth about 25–30 ms of revert
   overlay.
+
+## 11. Consumer cache memory
+
+A silt-cache store holds three things (`Store::mem_usage`, also
+`Cache::mem_usage`). Sizes below were measured following the mainnet feed
+with the default 64-block eviction and no reads of the store's own
+(`verify`'s pattern), in November 2026:
+
+| Part (`MemUsage` field) | What bounds it | Measured |
+|---|---|---|
+| Accounts and slots, with their indexes (`entries`) | eviction: entries unread for `evict_after_blocks` (64) | ~13 MiB, flat (~13k accounts, ~31k slots) |
+| Undo journal and head ring (`journal`) | `reorg_depth` blocks (64), ~0.2 MiB each | 12–14 MiB, flat |
+| Bytecode (`code`) | nothing: never evicted | 0.3–0.8 MiB/h from new deployments alone |
+
+A consumer that reads adds its own hot set to `entries`, and the code of
+every contract it reads to `code`. Code is content-addressed and never goes
+stale, so the store keeps it even through a drop to cold (`Store::clear`).
+Only a new `Cache` (or a process restart) releases it. **Code is the one
+part that grows for as long as the process runs:** a consumer that runs
+for weeks has to budget for it.
+
+**Soft limit.** `CacheConfig::soft_limit_bytes` (default 512 MiB;
+`None` turns it off) makes the eviction sweep log a WARN `silt-cache over
+its soft memory limit` with the total and the `entries`, `code` and
+`journal` parts. It logs on the first sweep over the limit, then hourly,
+and an INFO line once the store is back under. It never evicts or blocks:
+staying within budget is the consumer's job.
+
+When it fires, look at which part grew:
+
+- **`entries`:** the hot set. Lower `evict_after_blocks` (more misses,
+  each a lookup or RPC read), or read less.
+- **`journal`:** lower `reorg_depth` (deeper reorgs drop to cold instead
+  of rolling back; `0` keeps no journal).
+- **`code`:** restart the consumer on a schedule that suits it, or build a
+  new `Cache`. Either starts cold: reads go to the lookup path or RPC
+  until the feed warms the cache again (§6).
+
+**Estimate vs RSS.** `mem_usage` counts table capacities and sizes, not
+the allocator: it came to about 90% of the exact heap. The process RSS is
+higher still, by allocator overhead and fragmentation (7–10 MiB over a 30
+MiB store in a single-task probe; more with glibc's per-thread arenas).
+Set the limit with headroom below the memory you can give the cache, and
+watch RSS as well. `mem_usage` walks the store's maps; call it at most
+every few seconds.
+
+**`Cache::from_store`** consumers get no sweep: call `Store::evict(tip,
+max_age)` regularly (`verify` does every 8 blocks) and check
+`Store::mem_usage()` yourself.
