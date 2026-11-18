@@ -419,7 +419,9 @@ impl Store {
         self.stats.cold_drops.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Memory bound (PLAN T2.5): drop entries unread for `max_age` blocks.
+    /// Memory bound (PLAN T2.5): drop entries unread for `max_age` blocks,
+    /// and the slot sets of accounts left with no slots. Code stays (see
+    /// [`Store::clear`]).
     pub fn evict(&self, now: u64, max_age: u64) -> usize {
         let cutoff = now.saturating_sub(max_age);
         let before = self.accounts.len() + self.storage.len();
@@ -432,11 +434,77 @@ impl Store {
             }
             keep
         });
+        // An emptied set keeps its allocation, and every account that ever
+        // had a slot would keep one: the store grew without bound.
+        self.slots_by_acc.retain(|_, set| !set.is_empty());
         before - (self.accounts.len() + self.storage.len())
     }
 
     pub fn len(&self) -> (usize, usize) {
         (self.accounts.len(), self.storage.len())
+    }
+
+    /// Approximate heap the store holds, from table capacities and sizes
+    /// rather than the allocator; it leaves out allocator overhead, so the
+    /// process RSS is higher. Walks the slot sets and the code map: call it
+    /// per sweep, not per read.
+    pub fn mem_usage(&self) -> MemUsage {
+        use std::mem::size_of;
+        // hashbrown: about 8/7 buckets per unit of capacity, plus one
+        // control byte per bucket.
+        fn table<T>(capacity: usize) -> usize {
+            capacity * 8 / 7 * (size_of::<T>() + 1)
+        }
+        // `last_read`: an `Arc<AtomicU64>` per entry, two counts + the value.
+        const LAST_READ: usize = 24;
+        let sets: usize = self
+            .slots_by_acc
+            .iter()
+            .map(|e| table::<Word>(e.value().capacity()))
+            .sum();
+        let entries = table::<(Addr, AccountEntry)>(self.accounts.capacity())
+            + table::<((Addr, Word), SlotEntry)>(self.storage.capacity())
+            + table::<(Addr, HashSet<Word>)>(self.slots_by_acc.capacity())
+            + sets
+            + (self.accounts.len() + self.storage.len()) * LAST_READ;
+        // Each code entry: an `Arc<Vec<u8>>` (two counts + the Vec header).
+        let code = table::<(Word, Arc<Vec<u8>>)>(self.code.capacity())
+            + self
+                .code
+                .iter()
+                .map(|e| 16 + size_of::<Vec<u8>>() + e.value().capacity())
+                .sum::<usize>();
+        let journal = {
+            let journal = self.journal.lock().expect("journal lock");
+            journal
+                .blocks
+                .iter()
+                .map(|b| size_of::<BlockUndo>() + b.ops.capacity() * size_of::<Undo>())
+                .sum::<usize>()
+        };
+        let heads = self.heads.lock().expect("heads lock").capacity() * size_of::<HeadLite>();
+        MemUsage {
+            entries,
+            code,
+            journal: journal + heads,
+        }
+    }
+}
+
+/// [`Store::mem_usage`], in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemUsage {
+    /// Accounts and slots, with their indexes. Bounded by eviction.
+    pub entries: usize,
+    /// Bytecode. Never evicted: grows with every contract the store sees.
+    pub code: usize,
+    /// The undo journal and the head ring. Bounded by the reorg depth.
+    pub journal: usize,
+}
+
+impl MemUsage {
+    pub fn total(&self) -> usize {
+        self.entries + self.code + self.journal
     }
 }
 
@@ -561,6 +629,38 @@ mod tests {
         let evicted = store.evict(100, 64);
         assert_eq!(evicted, 1, "untouched slot evicted");
         assert!(store.slot(&addr, &[1; 32], 100).is_some());
+    }
+
+    #[test]
+    fn eviction_drops_emptied_slot_sets() {
+        let store = Store::new(64);
+        let (a, b) = ([0xA1; 20], [0xB2; 20]);
+        let mut d = diff(1, 1, 0);
+        d.storage = (0..50u8)
+            .map(|i| (a, [i; 32], [1; 32]))
+            .chain([(b, [1; 32], [1; 32])])
+            .collect();
+        store.apply(&d);
+        let full = store.mem_usage();
+        let _ = store.slot(&b, &[1; 32], 100); // touch
+        assert_eq!(store.evict(100, 64), 50);
+        assert!(
+            !store.slots_by_acc.contains_key(&a),
+            "a's emptied set dropped"
+        );
+        assert_eq!(store.slots_by_acc.get(&b).unwrap().len(), 1);
+        let after = store.mem_usage();
+        assert!(after.entries < full.entries, "{after:?} vs {full:?}");
+        assert_eq!(after.code, full.code);
+
+        // A later write recreates the set, so a destroy still finds it.
+        let mut d2 = diff(101, 101, 100);
+        d2.storage = vec![(a, [7; 32], [7; 32])];
+        store.apply(&d2);
+        let mut d3 = diff(102, 102, 101);
+        d3.accounts = vec![(a, None)];
+        store.apply(&d3);
+        assert!(store.slot(&a, &[7; 32], 102).is_none());
     }
 
     /// Everything the store holds, for comparing two stores.

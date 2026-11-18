@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::client::{ClientState, run_tcp};
 use crate::fallback::Fallback;
-use crate::store::{KECCAK_EMPTY, Store};
+use crate::store::{KECCAK_EMPTY, MemUsage, Store};
 use crate::{AccountView, HeadEvent};
 
 #[derive(Clone, Debug)]
@@ -32,7 +32,16 @@ pub struct CacheConfig {
     /// Reorgs up to this many blocks deep roll back; deeper ones drop to
     /// cold (PLAN D12). `0` = always drop to cold.
     pub reorg_depth: usize,
+    /// Soft memory limit on the store ([`Store::mem_usage`]), in bytes.
+    /// While the store is above it, the eviction sweep logs a warning: on
+    /// the first sweep over it, then once an hour. It never evicts or
+    /// blocks; keeping the cache in budget is the consumer's job
+    /// (`docs/runbook.md` §11). `None` = no check.
+    pub soft_limit_bytes: Option<usize>,
 }
+
+/// The default [`CacheConfig::soft_limit_bytes`]: 512 MiB.
+pub const DEFAULT_SOFT_LIMIT_BYTES: usize = 512 << 20;
 
 impl CacheConfig {
     pub fn new(rpc_url: impl Into<String>) -> Self {
@@ -44,6 +53,7 @@ impl CacheConfig {
             lookup_addr: None,
             lookup_timeout: Duration::from_millis(500),
             reorg_depth: crate::store::DEFAULT_REORG_DEPTH,
+            soft_limit_bytes: Some(DEFAULT_SOFT_LIMIT_BYTES),
         }
     }
 
@@ -118,13 +128,24 @@ impl Cache {
         {
             let cache = cache.clone();
             let max_age = cfg.evict_after_blocks;
+            let mut soft_limit = cfg.soft_limit_bytes.map(SoftLimit::new);
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     if let Some((tip, _)) = cache.store.tip() {
                         let evicted = cache.store.evict(tip, max_age);
                         let (accounts, slots) = cache.store.len();
-                        tracing::debug!(evicted, accounts, slots, "silt-cache eviction sweep");
+                        let mem = cache.store.mem_usage();
+                        tracing::debug!(
+                            evicted,
+                            accounts,
+                            slots,
+                            bytes = mem.total(),
+                            "silt-cache eviction sweep"
+                        );
+                        if let Some(soft_limit) = soft_limit.as_mut() {
+                            soft_limit.check(&mem, accounts, slots);
+                        }
                     }
                 }
             });
@@ -146,6 +167,12 @@ impl Cache {
 
     pub fn tip(&self) -> Option<(u64, Word)> {
         self.store.tip()
+    }
+
+    /// The store's approximate heap ([`Store::mem_usage`]), e.g. for a
+    /// metric. Walks the store's maps: call it every few seconds at most.
+    pub fn mem_usage(&self) -> MemUsage {
+        self.store.mem_usage()
     }
 
     /// The block lazy reads pin to, and the store epoch their fills must
@@ -275,6 +302,53 @@ impl Cache {
     }
 }
 
+/// Logs the sweep's soft-limit warnings ([`CacheConfig::soft_limit_bytes`]).
+struct SoftLimit {
+    limit: usize,
+    /// Consecutive sweeps over the limit.
+    over: u64,
+}
+
+impl SoftLimit {
+    /// Sweeps run every minute: warn on the first one over, then hourly.
+    const WARN_EVERY: u64 = 60;
+
+    fn new(limit: usize) -> Self {
+        Self { limit, over: 0 }
+    }
+
+    /// Whether this sweep warned.
+    fn check(&mut self, mem: &MemUsage, accounts: usize, slots: usize) -> bool {
+        let mib = |b: usize| b >> 20;
+        if mem.total() <= self.limit {
+            if self.over > 0 {
+                tracing::info!(
+                    mib = mib(mem.total()),
+                    limit_mib = mib(self.limit),
+                    "silt-cache back under its soft memory limit"
+                );
+            }
+            self.over = 0;
+            return false;
+        }
+        let warn = self.over.is_multiple_of(Self::WARN_EVERY);
+        if warn {
+            tracing::warn!(
+                mib = mib(mem.total()),
+                limit_mib = mib(self.limit),
+                entries_mib = mib(mem.entries),
+                code_mib = mib(mem.code),
+                journal_mib = mib(mem.journal),
+                accounts,
+                slots,
+                "silt-cache over its soft memory limit (see docs/runbook.md §11)"
+            );
+        }
+        self.over += 1;
+        warn
+    }
+}
+
 pub(crate) fn keccak(bytes: &[u8]) -> Word {
     use tiny_keccak::Hasher;
     let mut out = [0u8; 32];
@@ -367,6 +441,21 @@ mod tests {
             2,
             "hit serves from store"
         );
+    }
+
+    #[test]
+    fn soft_limit_warns_first_then_hourly() {
+        let mut soft = SoftLimit::new(100);
+        let at = |total| MemUsage {
+            entries: total,
+            ..MemUsage::default()
+        };
+        assert!(!soft.check(&at(100), 0, 0), "at the limit is fine");
+        assert!(soft.check(&at(101), 0, 0), "first sweep over warns");
+        let warned = (1..=120).filter(|_| soft.check(&at(150), 0, 0)).count();
+        assert_eq!(warned, 2, "then once every 60 sweeps");
+        assert!(!soft.check(&at(50), 0, 0));
+        assert!(soft.check(&at(101), 0, 0), "a new crossing warns again");
     }
 
     #[test]

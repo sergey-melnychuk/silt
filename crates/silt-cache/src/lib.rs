@@ -24,10 +24,11 @@ pub mod trie;
 
 use std::sync::Arc;
 
-pub use cache::{Cache, CacheConfig};
+pub use cache::{Cache, CacheConfig, DEFAULT_SOFT_LIMIT_BYTES};
 pub use fallback::{Fallback, HttpFallback, RpcAccount};
 pub use lookup::{LookupClient, LookupClientConfig, LookupError, LookupFallback};
 pub use silt_wire::{Addr, HeadLite, Word};
+pub use store::MemUsage;
 
 /// What the consumer loop reacts to (PLAN T2.4): heads to process, breaks
 /// to cancel in-flight work on.
