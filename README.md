@@ -196,9 +196,14 @@ ChainSpec>`); the lookup server only needs the node's provider.
   B; trie roots exact after rollback. The frames changed without a
   protocol version bump: every consumer is ours and is rebuilt with the
   node.
-- Pending live runs (PLAN M3 gates): the 24 h live-node equivalence soak
-  (running since 2026-11-17 13:53 UTC) and the wrapper kill/catch-up test
-  under load.
+- M3 soak (G3.1, `docs/soak.md`): 24 h against the live node
+  (2026-11-17/18), 7,190 blocks, 9,236,637 keys checked, 0 mismatches, 0
+  gaps; 4 one-block reorgs rolled back with 973 dropped-block keys checked
+  at the fork. Diff received p50 2.3 s / p99 7.0 s after the block's
+  timestamp, ~260 KB per block. A node restart (2026-11-18) kept the diff
+  stream continuous.
+- Pending live runs (PLAN M3 gates): a consumer connected through a node
+  restart under load (G3.2), and soak 3 (the RSS curve with `882d5c9`).
 
 Feed and lookup security model (PLAN D1): no auth/TLS — bind to localhost
 or a private network only.
