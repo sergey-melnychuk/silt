@@ -25,7 +25,7 @@ reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "b9abbcc1b9
 reth-stages-types = { git = "https://github.com/paradigmxyz/reth", rev = "b9abbcc1b982755baa9021e6874e2e58936ca65f", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
-postcard = { version = "1", features = ["alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }
 eyre = "0.6"
 tracing = "0.1"
