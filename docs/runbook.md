@@ -215,14 +215,27 @@ Gates before deploying:
 
 A silt-cache store holds three things (`Store::mem_usage`, also
 `Cache::mem_usage`). Sizes below were measured following the mainnet feed
-with the default 64-block eviction and no reads of the store's own
-(`verify`'s pattern), in November 2026:
+with a 64-block eviction and no reads of the store's own (`verify`'s
+pattern), in November 2026:
 
 | Part (`MemUsage` field) | What bounds it | Measured |
 |---|---|---|
-| Accounts and slots, with their indexes (`entries`) | eviction: entries unread for `evict_after_blocks` (64) | ~13 MiB, flat (~13k accounts, ~31k slots) |
+| Accounts and slots, with their indexes (`entries`) | eviction: entries unread for `evict_after_blocks` | ~13 MiB, flat at 64 blocks (~13k accounts, ~31k slots, ~290 B each) |
 | Undo journal and head ring (`journal`) | `reorg_depth` blocks (64), ~0.2 MiB each | 12–14 MiB, flat |
 | Bytecode (`code`) | nothing: never evicted | 0.3–0.8 MiB/h from new deployments alone |
+
+**Since PLAN M6 the default eviction age is 2048 blocks (~7 h,
+`DEFAULT_EVICT_AFTER_BLOCKS`), and diffs carry read touches (D13).** Both
+trade memory for misses: every entry kept is a simulation read that
+doesn't go to the node (~135 µs each, against ~11 µs for a whole
+transaction served from the cache). `entries` then holds every key the
+chain wrote or read in the last 2048 blocks, plus the consumer's own hot
+set. A block writes ~400 accounts and ~600 slots and reads ~600 and
+~1,450, mostly the same popular contracts block after block. The
+estimate, until it's measured on the feed with read touches, is **150–350
+MiB of `entries`** at ~290 B per key. That's under the 512 MiB soft
+limit, with the journal and code on top. If it runs over, lower
+`evict_after_blocks`: the cost is misses, not correctness.
 
 A consumer that reads adds its own hot set to `entries`, and the code of
 every contract it reads to `code`. Code is content-addressed and never goes

@@ -202,6 +202,14 @@ ChainSpec>`); the lookup server only needs the node's provider.
   at the fork. Diff received p50 2.3 s / p99 7.0 s after the block's
   timestamp, ~260 KB per block. A node restart (2026-11-18) kept the diff
   stream continuous.
+- M6 simulation latency vs reth's database (in progress): the same yevm
+  executor and transactions on silt's cache and on reth's read-only
+  datadir (`sim-bench`, yevm-reth). All 6,443 transactions so far have
+  identical outcomes. Whole blocks are faster on silt (p50 75 vs 79 ms,
+  worst 136 vs 231 ms). A transaction served from the cache takes 11 µs
+  against reth's 69 µs, but each miss costs a ~150 µs round trip to the
+  node, so per-transaction p50 still trails (255 vs 158 µs). D13 read
+  touches and lookup view reuse target the misses.
 - Pending live runs (PLAN M3 gates): a consumer connected through a node
   restart under load (G3.2), and soak 3 (the RSS curve with `882d5c9`).
 

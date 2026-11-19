@@ -285,6 +285,8 @@ fn assemble(
         storage,
         code,
         receipts,
+        read_accounts: Vec::new(),
+        read_storage: Vec::new(),
     })
 }
 

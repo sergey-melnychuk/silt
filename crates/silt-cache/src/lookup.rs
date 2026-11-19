@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, oneshot, watch};
 
-use crate::fallback::{Fallback, RpcAccount, hex_word};
+use crate::fallback::{AccountMeta, Fallback, RpcAccount, hex_word};
 
 #[derive(Clone, Debug)]
 pub struct LookupClientConfig {
@@ -734,6 +734,94 @@ impl Fallback for LookupFallback {
 
     async fn chain_id(&self) -> eyre::Result<u64> {
         self.inner.chain_id().await
+    }
+
+    /// Accounts with their code inline, one Account frame per
+    /// `MAX_CODE_ITEMS`: a miss is one round trip even for code the cache
+    /// hasn't seen, and the server's code hash saves hashing it here. Any
+    /// failure falls back to the inner fallback for the whole batch.
+    async fn accounts_meta_at(
+        &self,
+        addrs: &[Addr],
+        block_hash: &Word,
+    ) -> eyre::Result<Vec<AccountMeta>> {
+        let mut out = Vec::with_capacity(addrs.len());
+        for chunk in addrs.chunks(silt_wire::lookup::MAX_CODE_ITEMS) {
+            match self.client.accounts(block_hash, chunk, true).await {
+                Ok(reply) if reply.items.iter().all(|i| i.status != ItemStatus::Error) => {
+                    out.extend(reply.items.into_iter().map(|i| AccountMeta {
+                        balance: i.balance,
+                        nonce: i.nonce,
+                        code_hash: i.code_hash,
+                        code: i.code,
+                    }));
+                }
+                Err(LookupError::Status(Status::UnknownBlock)) => {
+                    return Err(unknown_block(block_hash));
+                }
+                other => {
+                    let err = match other {
+                        Err(err) => err.to_string(),
+                        Ok(_) => "item error".into(),
+                    };
+                    self.fell_back("accounts", &err);
+                    return self.inner.accounts_meta_at(addrs, block_hash).await;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn storages_at(
+        &self,
+        keys: &[(Addr, Word)],
+        block_hash: &Word,
+    ) -> eyre::Result<Vec<Word>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(MAX_ITEMS) {
+            match self.client.storage(block_hash, chunk).await {
+                Ok(reply) if reply.items.iter().all(|i| i.status != ItemStatus::Error) => {
+                    out.extend(reply.items.into_iter().map(|i| i.value));
+                }
+                Err(LookupError::Status(Status::UnknownBlock)) => {
+                    return Err(unknown_block(block_hash));
+                }
+                other => {
+                    let err = match other {
+                        Err(err) => err.to_string(),
+                        Ok(_) => "item error".into(),
+                    };
+                    self.fell_back("storages", &err);
+                    return self.inner.storages_at(keys, block_hash).await;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Code by hash over op Code; a hash the server doesn't answer comes
+    /// back `None` (the cache then reads the account whole).
+    async fn codes_by_hash(
+        &self,
+        hashes: &[Word],
+        block_hash: &Word,
+    ) -> eyre::Result<Vec<Option<Vec<u8>>>> {
+        let mut out = Vec::with_capacity(hashes.len());
+        for chunk in hashes.chunks(silt_wire::lookup::MAX_CODE_ITEMS) {
+            match self.client.code(block_hash, chunk).await {
+                Ok(reply) => out.extend(
+                    reply
+                        .items
+                        .into_iter()
+                        .map(|i| (i.status == ItemStatus::Ok).then_some(i.code)),
+                ),
+                Err(err) => {
+                    self.fell_back("code", &err);
+                    out.extend(std::iter::repeat_n(None, chunk.len()));
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

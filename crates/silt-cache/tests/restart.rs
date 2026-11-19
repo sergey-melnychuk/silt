@@ -99,6 +99,8 @@ fn span(start: u64, n: u64) -> BlockDiff {
         storage,
         code: vec![],
         receipts: vec![],
+        read_accounts: Vec::new(),
+        read_storage: Vec::new(),
     }
 }
 

@@ -19,13 +19,16 @@ pub mod store;
 #[cfg(feature = "yevm")]
 pub mod adapter;
 
+#[cfg(feature = "yevm")]
+pub mod sim;
+
 #[cfg(feature = "trie")]
 pub mod trie;
 
 use std::sync::Arc;
 
-pub use cache::{Cache, CacheConfig, DEFAULT_SOFT_LIMIT_BYTES};
-pub use fallback::{Fallback, HttpFallback, RpcAccount};
+pub use cache::{Cache, CacheConfig, DEFAULT_EVICT_AFTER_BLOCKS, DEFAULT_SOFT_LIMIT_BYTES};
+pub use fallback::{AccountMeta, Fallback, HttpFallback, RpcAccount};
 pub use lookup::{LookupClient, LookupClientConfig, LookupError, LookupFallback};
 pub use silt_wire::{Addr, HeadLite, Word};
 pub use store::MemUsage;

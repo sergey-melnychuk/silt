@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::client::{ClientState, run_tcp};
 use crate::fallback::Fallback;
-use crate::store::{KECCAK_EMPTY, MemUsage, Store};
+use crate::store::{MemUsage, Store};
 use crate::{AccountView, HeadEvent};
 
 #[derive(Clone, Debug)]
@@ -43,12 +43,19 @@ pub struct CacheConfig {
 /// The default [`CacheConfig::soft_limit_bytes`]: 512 MiB.
 pub const DEFAULT_SOFT_LIMIT_BYTES: usize = 512 << 20;
 
+/// The default [`CacheConfig::evict_after_blocks`]: 2048 blocks (~7 h).
+/// Entries fetched on a miss stay until unread this long; the feed keeps
+/// them correct meanwhile, so a longer life only costs memory
+/// (`docs/runbook.md` §11), and every entry kept is a miss a simulation
+/// doesn't pay (PLAN M6).
+pub const DEFAULT_EVICT_AFTER_BLOCKS: u64 = 2048;
+
 impl CacheConfig {
     pub fn new(rpc_url: impl Into<String>) -> Self {
         Self {
             feed_addr: None,
             rpc_url: rpc_url.into(),
-            evict_after_blocks: 64,
+            evict_after_blocks: DEFAULT_EVICT_AFTER_BLOCKS,
             liveness: Duration::from_secs(30),
             lookup_addr: None,
             lookup_timeout: Duration::from_millis(500),
@@ -190,16 +197,7 @@ impl Cache {
     pub async fn account(&self, addr: &Addr) -> eyre::Result<AccountView> {
         let (now, pin_hash, epoch) = self.pin().await?;
         if let Some(entry) = self.store.account(addr, now) {
-            let code = match self.store.code(&entry.code_hash) {
-                Some(code) => code,
-                None => {
-                    // Diff told us the hash but the code predates the feed.
-                    let fetched = self.fallback.account_at(addr, &pin_hash).await?;
-                    let code = Arc::new(fetched.code);
-                    self.store.insert_code(entry.code_hash, code.clone());
-                    code
-                }
-            };
+            let code = self.code_for(addr, &entry.code_hash, &pin_hash).await?;
             return Ok(AccountView {
                 balance: entry.balance,
                 nonce: entry.nonce,
@@ -212,7 +210,7 @@ impl Cache {
             .misses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // Single-flight: N concurrent misses on one key -> one RPC fetch.
+        // Single-flight: N concurrent misses on one key -> one fetch.
         let flight = self
             .flights
             .entry(FlightKey::Account(*addr))
@@ -220,10 +218,7 @@ impl Cache {
             .clone();
         let _guard = flight.lock().await;
         if let Some(entry) = self.store.account(addr, now) {
-            let code = self
-                .store
-                .code(&entry.code_hash)
-                .unwrap_or_else(|| Arc::new(Vec::new()));
+            let code = self.code_for(addr, &entry.code_hash, &pin_hash).await?;
             return Ok(AccountView {
                 balance: entry.balance,
                 nonce: entry.nonce,
@@ -231,29 +226,148 @@ impl Cache {
                 code,
             });
         }
-        let fetched = self.fallback.account_at(addr, &pin_hash).await?;
-        let code_hash = if fetched.code.is_empty() {
-            KECCAK_EMPTY
-        } else {
-            keccak(&fetched.code)
-        };
-        let code = Arc::new(fetched.code);
-        self.store.insert_code(code_hash, code.clone());
-        self.store.insert_lazy_account(
-            *addr,
-            fetched.balance,
-            fetched.nonce,
-            code_hash,
-            now,
-            epoch,
-        );
+        // One round trip: balance, nonce, code hash and (from the lookup
+        // path) the code itself, kept by hash for good.
+        let meta = self
+            .fallback
+            .accounts_meta_at(&[*addr], &pin_hash)
+            .await?
+            .pop()
+            .ok_or_else(|| eyre::eyre!("fallback: no answer for account"))?;
+        if let Some(code) = meta.code
+            && !self.store.has_code(&meta.code_hash)
+        {
+            self.store.insert_code(meta.code_hash, Arc::new(code));
+        }
+        let code = self.code_for(addr, &meta.code_hash, &pin_hash).await?;
+        self.store
+            .insert_lazy_account(*addr, meta.balance, meta.nonce, meta.code_hash, now, epoch);
         self.flights.remove(&FlightKey::Account(*addr));
         Ok(AccountView {
-            balance: fetched.balance,
-            nonce: fetched.nonce,
-            code_hash,
+            balance: meta.balance,
+            nonce: meta.nonce,
+            code_hash: meta.code_hash,
             code,
         })
+    }
+
+    /// The bytecode for `hash` (of `addr`'s account): from the store, else
+    /// by hash from the fallback, else the account read whole.
+    async fn code_for(
+        &self,
+        addr: &Addr,
+        hash: &Word,
+        pin_hash: &Word,
+    ) -> eyre::Result<Arc<Vec<u8>>> {
+        if let Some(code) = self.store.code(hash) {
+            return Ok(code);
+        }
+        let by_hash = self
+            .fallback
+            .codes_by_hash(&[*hash], pin_hash)
+            .await?
+            .pop()
+            .flatten();
+        let bytes = match by_hash {
+            Some(bytes) => bytes,
+            None => self.fallback.account_at(addr, pin_hash).await?.code,
+        };
+        let code = Arc::new(bytes);
+        self.store.insert_code(*hash, code.clone());
+        Ok(code)
+    }
+
+    /// Fetches whatever of `accounts` (with their code) and `slots` the
+    /// store doesn't hold, batched: one round trip for the accounts and
+    /// the slots together, one more only for code never seen before. They
+    /// land as lazy fills pinned at the tip, like misses, so a simulation
+    /// about to read them finds them (PLAN M6). Counted in
+    /// `stats.prefetched`, not as misses.
+    pub async fn prefetch(&self, accounts: &[Addr], slots: &[(Addr, Word)]) -> eyre::Result<()> {
+        let (now, pin_hash, epoch) = self.pin().await?;
+        let mut accs: Vec<Addr> = accounts
+            .iter()
+            .filter(|a| !self.store.has_account(a))
+            .copied()
+            .collect();
+        accs.sort_unstable();
+        accs.dedup();
+        let mut keys: Vec<(Addr, Word)> = slots
+            .iter()
+            .filter(|(a, s)| !self.store.has_slot(a, s))
+            .copied()
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        if accs.is_empty() && keys.is_empty() {
+            return Ok(());
+        }
+        let (metas, values) = tokio::join!(
+            async {
+                if accs.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    self.fallback.accounts_meta_at(&accs, &pin_hash).await
+                }
+            },
+            async {
+                if keys.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    self.fallback.storages_at(&keys, &pin_hash).await
+                }
+            }
+        );
+        let (metas, values) = (metas?, values?);
+
+        let mut unknown: Vec<Word> = Vec::new();
+        for meta in &metas {
+            match &meta.code {
+                _ if self.store.has_code(&meta.code_hash) => {}
+                Some(code) => self
+                    .store
+                    .insert_code(meta.code_hash, Arc::new(code.clone())),
+                None => unknown.push(meta.code_hash),
+            }
+        }
+        unknown.sort_unstable();
+        unknown.dedup();
+        let mut no_code = std::collections::HashSet::new();
+        if !unknown.is_empty() {
+            let codes = self.fallback.codes_by_hash(&unknown, &pin_hash).await?;
+            for (hash, code) in unknown.iter().zip(codes) {
+                match code {
+                    Some(code) => self.store.insert_code(*hash, Arc::new(code)),
+                    // Left to the read's own miss path (account read whole).
+                    None => {
+                        no_code.insert(*hash);
+                    }
+                }
+            }
+        }
+
+        let mut filled = 0u64;
+        for (addr, meta) in accs.iter().zip(metas) {
+            if no_code.contains(&meta.code_hash) {
+                continue;
+            }
+            filled += self.store.insert_lazy_account(
+                *addr,
+                meta.balance,
+                meta.nonce,
+                meta.code_hash,
+                now,
+                epoch,
+            ) as u64;
+        }
+        for ((addr, slot), value) in keys.iter().zip(values) {
+            filled += self.store.insert_lazy_slot(*addr, *slot, value, now, epoch) as u64;
+        }
+        self.store
+            .stats
+            .prefetched
+            .fetch_add(filled, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     pub async fn storage(&self, addr: &Addr, slot: &Word) -> eyre::Result<Word> {
@@ -443,6 +557,127 @@ mod tests {
         );
     }
 
+    /// A fallback that answers batches and code by hash (like the lookup
+    /// path), counting each kind of call.
+    #[derive(Default)]
+    struct BatchChain {
+        singles: AtomicU64,
+        batches: AtomicU64,
+        code_calls: AtomicU64,
+    }
+
+    const CODE: [u8; 2] = [0x60, 0x00];
+
+    #[async_trait::async_trait]
+    impl Fallback for BatchChain {
+        async fn account_at(&self, _addr: &Addr, _h: &Word) -> eyre::Result<RpcAccount> {
+            self.singles.fetch_add(1, Ordering::SeqCst);
+            Ok(RpcAccount {
+                balance: [3; 32],
+                nonce: 7,
+                code: CODE.to_vec(),
+            })
+        }
+        async fn storage_at(&self, _a: &Addr, _s: &Word, _h: &Word) -> eyre::Result<Word> {
+            self.singles.fetch_add(1, Ordering::SeqCst);
+            Ok([42; 32])
+        }
+        async fn head_by_number(&self, _n: Option<u64>) -> eyre::Result<HeadLite> {
+            MockChain { calls: 0.into() }.head_by_number(None).await
+        }
+        async fn block_json(&self, _n: u64, _f: bool) -> eyre::Result<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+        async fn chain_id(&self) -> eyre::Result<u64> {
+            Ok(1)
+        }
+        async fn accounts_meta_at(
+            &self,
+            addrs: &[Addr],
+            _h: &Word,
+        ) -> eyre::Result<Vec<crate::fallback::AccountMeta>> {
+            self.batches.fetch_add(1, Ordering::SeqCst);
+            Ok(addrs
+                .iter()
+                .map(|a| crate::fallback::AccountMeta {
+                    balance: [a[0]; 32],
+                    nonce: a[0] as u64,
+                    code_hash: keccak(&CODE),
+                    code: None,
+                })
+                .collect())
+        }
+        async fn storages_at(&self, keys: &[(Addr, Word)], _h: &Word) -> eyre::Result<Vec<Word>> {
+            self.batches.fetch_add(1, Ordering::SeqCst);
+            Ok(keys.iter().map(|(_, s)| *s).collect())
+        }
+        async fn codes_by_hash(
+            &self,
+            hashes: &[Word],
+            _h: &Word,
+        ) -> eyre::Result<Vec<Option<Vec<u8>>>> {
+            self.code_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(hashes.iter().map(|_| Some(CODE.to_vec())).collect())
+        }
+    }
+
+    /// PLAN M6: a prefetch takes one batch for accounts, one for slots and
+    /// one for code never seen; the reads after it all hit, and a second
+    /// prefetch of the same keys costs nothing.
+    #[tokio::test]
+    async fn prefetch_batches_then_reads_hit() {
+        let mock = Arc::new(BatchChain::default());
+        let (cache, _events) = Cache::with_fallback(
+            CacheConfig::new("unused"),
+            mock.clone() as Arc<dyn Fallback>,
+        );
+        let (a1, a2) = ([1u8; 20], [2u8; 20]);
+        let (s1, s2) = ([0x11u8; 32], [0x22u8; 32]);
+        cache
+            .prefetch(&[a1, a2, a1], &[(a1, s1), (a2, s2), (a1, s1)])
+            .await
+            .unwrap();
+        assert_eq!(mock.batches.load(Ordering::SeqCst), 2, "accounts + slots");
+        assert_eq!(
+            mock.code_calls.load(Ordering::SeqCst),
+            1,
+            "one unknown code hash"
+        );
+        assert_eq!(cache.store.stats.prefetched.load(Ordering::SeqCst), 4);
+
+        let view = cache.account(&a2).await.unwrap();
+        assert_eq!((view.nonce, view.balance), (2, [2; 32]));
+        assert_eq!(view.code.as_slice(), &CODE);
+        assert_eq!(cache.storage(&a1, &s1).await.unwrap(), s1);
+        assert_eq!(cache.store.stats.misses.load(Ordering::SeqCst), 0);
+        assert_eq!(mock.singles.load(Ordering::SeqCst), 0, "no per-key fetches");
+
+        cache.prefetch(&[a1, a2], &[(a2, s2)]).await.unwrap();
+        assert_eq!(mock.batches.load(Ordering::SeqCst), 2, "all held: no calls");
+    }
+
+    /// A miss fetches the account without code, then the code by hash
+    /// once; a second account with the same code costs no code fetch.
+    #[tokio::test]
+    async fn miss_fetches_code_by_hash_once() {
+        let mock = Arc::new(BatchChain::default());
+        let (cache, _events) = Cache::with_fallback(
+            CacheConfig::new("unused"),
+            mock.clone() as Arc<dyn Fallback>,
+        );
+        let view = cache.account(&[5u8; 20]).await.unwrap();
+        assert_eq!(view.code.as_slice(), &CODE);
+        assert_eq!(view.code_hash, keccak(&CODE));
+        assert_eq!(mock.code_calls.load(Ordering::SeqCst), 1);
+        cache.account(&[6u8; 20]).await.unwrap();
+        assert_eq!(
+            mock.code_calls.load(Ordering::SeqCst),
+            1,
+            "code cached by hash"
+        );
+        assert_eq!(mock.singles.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn soft_limit_warns_first_then_hourly() {
         let mut soft = SoftLimit::new(100);
@@ -460,6 +695,6 @@ mod tests {
 
     #[test]
     fn keccak_empty_matches_constant() {
-        assert_eq!(keccak(&[]), KECCAK_EMPTY);
+        assert_eq!(keccak(&[]), crate::store::KECCAK_EMPTY);
     }
 }

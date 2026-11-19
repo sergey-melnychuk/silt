@@ -986,6 +986,8 @@ mod tests {
             storage,
             code: vec![],
             receipts: vec![],
+            read_accounts: Vec::new(),
+            read_storage: Vec::new(),
         };
         (diff, next)
     }

@@ -27,6 +27,9 @@ pub use silt_wire::KECCAK_EMPTY;
 pub enum Provenance {
     Diff,
     Lazy,
+    /// A read touch from the feed (PLAN D13): a value the chain read at a
+    /// block, current at that block.
+    Read,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +53,8 @@ pub struct SlotEntry {
 pub struct Stats {
     pub hits: AtomicU64,
     pub misses: AtomicU64,
+    /// Entries a prefetch fetched ahead of a read (batched; not misses).
+    pub prefetched: AtomicU64,
     pub applied_blocks: AtomicU64,
     pub cold_drops: AtomicU64,
     /// Reorgs undone by [`Store::rollback`], and the blocks they undid.
@@ -212,6 +217,44 @@ impl Store {
             );
             self.slots_by_acc.entry(*addr).or_default().insert(*slot);
             ops.push(Undo::Slot(*addr, *slot, prev));
+        }
+        // D13 read touches: values at `diff.number` that the span left
+        // alone. Like lazy fills they never clobber (an entry held is
+        // current: the feed keeps it so) and a rollback removes them; an
+        // entry already held is marked read now, so keys the chain keeps
+        // reading are never evicted.
+        for (addr, c) in &diff.read_accounts {
+            match self.accounts.entry(*addr) {
+                dashmap::Entry::Occupied(e) => {
+                    e.get().last_read.fetch_max(diff.number, Ordering::Relaxed);
+                }
+                dashmap::Entry::Vacant(v) => {
+                    v.insert(AccountEntry {
+                        balance: c.balance,
+                        nonce: c.nonce,
+                        code_hash: c.code_hash,
+                        provenance: Provenance::Read,
+                        last_read: Arc::new(AtomicU64::new(diff.number)),
+                    });
+                    ops.push(Undo::Account(*addr, None));
+                }
+            }
+        }
+        for (addr, slot, value) in &diff.read_storage {
+            match self.storage.entry((*addr, *slot)) {
+                dashmap::Entry::Occupied(e) => {
+                    e.get().last_read.fetch_max(diff.number, Ordering::Relaxed);
+                }
+                dashmap::Entry::Vacant(v) => {
+                    v.insert(SlotEntry {
+                        value: *value,
+                        provenance: Provenance::Read,
+                        last_read: Arc::new(AtomicU64::new(diff.number)),
+                    });
+                    self.slots_by_acc.entry(*addr).or_default().insert(*slot);
+                    ops.push(Undo::Slot(*addr, *slot, None));
+                }
+            }
         }
         let prev_tip = self.tip();
         {
@@ -397,6 +440,22 @@ impl Store {
         Some(entry.value)
     }
 
+    /// Whether `addr` is held, without counting a hit or marking a read
+    /// (prefetch decides what to fetch with it).
+    pub fn has_account(&self, addr: &Addr) -> bool {
+        self.accounts.contains_key(addr)
+    }
+
+    /// Whether `(addr, slot)` is held; see [`Store::has_account`].
+    pub fn has_slot(&self, addr: &Addr, slot: &Word) -> bool {
+        self.storage.contains_key(&(*addr, *slot))
+    }
+
+    /// Whether the bytecode for `hash` is held (empty code always is).
+    pub fn has_code(&self, hash: &Word) -> bool {
+        *hash == KECCAK_EMPTY || *hash == [0u8; 32] || self.code.contains_key(hash)
+    }
+
     pub fn code(&self, hash: &Word) -> Option<Arc<Vec<u8>>> {
         if *hash == KECCAK_EMPTY || *hash == [0u8; 32] {
             return Some(Arc::new(Vec::new()));
@@ -537,6 +596,8 @@ mod tests {
             storage: vec![],
             code: vec![],
             receipts: vec![],
+            read_accounts: Vec::new(),
+            read_storage: Vec::new(),
         }
     }
 
@@ -629,6 +690,61 @@ mod tests {
         let evicted = store.evict(100, 64);
         assert_eq!(evicted, 1, "untouched slot evicted");
         assert!(store.slot(&addr, &[1; 32], 100).is_some());
+    }
+
+    /// D13: read touches fill what the store lacks, never clobber what it
+    /// holds, keep held entries from aging out, and roll back like lazy
+    /// fills.
+    #[test]
+    fn read_touches_fill_refresh_and_roll_back() {
+        let s = Store::new(256);
+        let (a, b) = ([0xAA; 20], [0xBB; 20]);
+        let change = |n: u8| AccountChange {
+            balance: [n; 32],
+            nonce: n as u64,
+            code_hash: KECCAK_EMPTY,
+        };
+        let mut d1 = diff(1, 1, 0);
+        d1.accounts = vec![(a, Some(change(1)))];
+        d1.storage = vec![(a, [1; 32], [11; 32])];
+        s.apply(&d1);
+
+        let mut d2 = diff(2, 2, 1);
+        // `a` and its slot are held: the touch must not overwrite them.
+        d2.read_accounts = vec![(a, change(9)), (b, change(2))];
+        d2.read_storage = vec![(a, [1; 32], [99; 32]), (b, [2; 32], [22; 32])];
+        s.apply(&d2);
+        assert_eq!(
+            s.account(&a, 2).unwrap().balance,
+            [1; 32],
+            "held: not clobbered"
+        );
+        assert_eq!(s.slot(&a, &[1; 32], 2), Some([11; 32]));
+        let fresh = s.account(&b, 2).unwrap();
+        assert_eq!(
+            (fresh.balance, fresh.provenance),
+            ([2; 32], Provenance::Read)
+        );
+        assert_eq!(s.slot(&b, &[2; 32], 2), Some([22; 32]));
+
+        // A held key the chain keeps reading doesn't age out.
+        let mut d3 = diff(3, 3, 2);
+        d3.read_accounts = vec![(a, change(1))];
+        s.apply(&d3);
+        s.evict(3 + 64, 64);
+        assert!(
+            s.has_account(&a),
+            "touched at 3: kept at 67 with max age 64"
+        );
+        assert!(!s.has_account(&b), "last read at 2: evicted");
+
+        // Rolling back d3 and d2 removes what the touches inserted.
+        let s = Store::new(256);
+        s.apply(&d1);
+        s.apply(&d2);
+        assert!(s.rollback(1, [1; 32]));
+        assert!(!s.has_account(&b) && !s.has_slot(&b, &[2; 32]));
+        assert_eq!(s.account(&a, 1).unwrap().balance, [1; 32]);
     }
 
     #[test]
@@ -745,6 +861,8 @@ mod tests {
             storage: storage.into_iter().map(|((a, k), v)| (a, k, v)).collect(),
             code: vec![],
             receipts: vec![],
+            read_accounts: Vec::new(),
+            read_storage: Vec::new(),
         }
     }
 

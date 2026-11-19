@@ -92,6 +92,13 @@ pub struct BlockDiff {
     pub code: Vec<(Word, Vec<u8>)>,
     /// Receipts per block in the span: (number, block hash, receipts).
     pub receipts: Vec<(u64, Word, Vec<ReceiptLite>)>,
+    /// Read touches (PLAN D13): accounts the span's blocks read and did not
+    /// write, at their value at `number` (unchanged by the span). Empty when
+    /// the node's host doesn't report reads.
+    pub read_accounts: Vec<(Addr, AccountChange)>,
+    /// Slots the span read and did not write: (owner, slot, value at
+    /// `number`). Never a slot of an account the span destroyed.
+    pub read_storage: Vec<(Addr, Word, Word)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,8 +144,126 @@ impl Frame {
         Ok(postcard::to_allocvec(self)?)
     }
 
+    /// Decodes a frame. D13 appended the read touches to `BlockDiff`, the
+    /// last thing in a `Diff` frame: an older decoder ignores them (postcard
+    /// doesn't check for trailing bytes), and this decoder reads a `Diff`
+    /// from an older node through [`legacy`], with no read touches.
     pub fn decode(bytes: &[u8]) -> eyre::Result<Self> {
-        Ok(postcard::from_bytes(bytes)?)
+        match postcard::from_bytes(bytes) {
+            Ok(frame) => Ok(frame),
+            Err(err) => match postcard::from_bytes::<legacy::Frame>(bytes) {
+                Ok(frame) => Ok(frame.into()),
+                Err(_) => Err(err.into()),
+            },
+        }
+    }
+}
+
+/// The frame layout before D13 (2026-11-18): `BlockDiff` without the read
+/// touches. Kept so consumers built after D13 still read a node built
+/// before it; drop once every node has D13.
+pub mod legacy {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct BlockDiff {
+        pub span_start: u64,
+        pub number: u64,
+        pub hash: Word,
+        pub parent_hash: Word,
+        pub heads: Vec<HeadLite>,
+        pub accounts: Vec<(Addr, Option<AccountChange>)>,
+        pub storage: Vec<(Addr, Word, Word)>,
+        pub code: Vec<(Word, Vec<u8>)>,
+        pub receipts: Vec<(u64, Word, Vec<ReceiptLite>)>,
+    }
+
+    /// Variants in the same order as [`super::Frame`] (postcard encodes
+    /// the variant index).
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum Frame {
+        Hello {
+            magic: [u8; 4],
+            version: u16,
+            chain_id: u64,
+            genesis_hash: Word,
+            tip: u64,
+        },
+        Refused {
+            reason: String,
+        },
+        Subscribe {
+            from: Option<u64>,
+            parent_hash: Option<Word>,
+        },
+        Diff(BlockDiff),
+        Reorg {
+            fork_number: u64,
+            fork_hash: Word,
+        },
+        Heartbeat {
+            height: u64,
+            spool_depth: u32,
+        },
+        GapTooOld {
+            oldest_available: u64,
+        },
+    }
+
+    impl From<BlockDiff> for super::BlockDiff {
+        fn from(d: BlockDiff) -> Self {
+            Self {
+                span_start: d.span_start,
+                number: d.number,
+                hash: d.hash,
+                parent_hash: d.parent_hash,
+                heads: d.heads,
+                accounts: d.accounts,
+                storage: d.storage,
+                code: d.code,
+                receipts: d.receipts,
+                read_accounts: Vec::new(),
+                read_storage: Vec::new(),
+            }
+        }
+    }
+
+    impl From<Frame> for super::Frame {
+        fn from(f: Frame) -> Self {
+            match f {
+                Frame::Hello {
+                    magic,
+                    version,
+                    chain_id,
+                    genesis_hash,
+                    tip,
+                } => Self::Hello {
+                    magic,
+                    version,
+                    chain_id,
+                    genesis_hash,
+                    tip,
+                },
+                Frame::Refused { reason } => Self::Refused { reason },
+                Frame::Subscribe { from, parent_hash } => Self::Subscribe { from, parent_hash },
+                Frame::Diff(d) => Self::Diff(d.into()),
+                Frame::Reorg {
+                    fork_number,
+                    fork_hash,
+                } => Self::Reorg {
+                    fork_number,
+                    fork_hash,
+                },
+                Frame::Heartbeat {
+                    height,
+                    spool_depth,
+                } => Self::Heartbeat {
+                    height,
+                    spool_depth,
+                },
+                Frame::GapTooOld { oldest_available } => Self::GapTooOld { oldest_available },
+            }
+        }
     }
 }
 
@@ -308,6 +433,21 @@ mod tests {
                     )
                 })
                 .collect(),
+            read_accounts: (0..rng.next() % 6)
+                .map(|_| {
+                    (
+                        rng.addr(),
+                        AccountChange {
+                            balance: rng.word(),
+                            nonce: rng.next(),
+                            code_hash: rng.word(),
+                        },
+                    )
+                })
+                .collect(),
+            read_storage: (0..rng.next() % 10)
+                .map(|_| (rng.addr(), rng.word(), rng.word()))
+                .collect(),
         }
     }
 
@@ -336,6 +476,52 @@ mod tests {
             };
             let decoded = Frame::decode(&frame.encode().unwrap()).unwrap();
             assert_eq!(frame, decoded, "iteration {i}");
+        }
+    }
+
+    /// D13 compatibility, both ways, without a version bump: a decoder
+    /// that predates the read touches reads a new `Diff` frame (trailing
+    /// bytes ignored), and the new decoder reads an old one (no touches).
+    #[test]
+    fn read_touches_are_compatible_both_ways() {
+        let mut rng = Rng(0xD13);
+        let mut with_touches = 0;
+        for _ in 0..2_000 {
+            let new = random_diff(&mut rng);
+            with_touches +=
+                usize::from(!new.read_accounts.is_empty() || !new.read_storage.is_empty());
+            let bytes = Frame::Diff(new.clone()).encode().unwrap();
+
+            // Old consumer, new node.
+            let old: legacy::Frame = postcard::from_bytes(&bytes).unwrap();
+            let legacy::Frame::Diff(old) = old else {
+                panic!("decoded as another variant")
+            };
+            let mut expect = new.clone();
+            expect.read_accounts.clear();
+            expect.read_storage.clear();
+            assert_eq!(BlockDiff::from(old.clone()), expect);
+
+            // New consumer, old node.
+            let old_bytes = postcard::to_allocvec(&legacy::Frame::Diff(old)).unwrap();
+            assert_eq!(Frame::decode(&old_bytes).unwrap(), Frame::Diff(expect));
+        }
+        assert!(with_touches > 1_000, "the property saw read touches");
+
+        // Frames other than Diff are byte-identical in both layouts.
+        for frame in [
+            hello(1, [7; 32], 42),
+            Frame::Heartbeat {
+                height: 9,
+                spool_depth: 3,
+            },
+            Frame::GapTooOld {
+                oldest_available: 5,
+            },
+        ] {
+            let bytes = frame.encode().unwrap();
+            let old: legacy::Frame = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(postcard::to_allocvec(&old).unwrap(), bytes);
         }
     }
 
@@ -373,6 +559,8 @@ mod tests {
             storage: vec![([0xBB; 20], [5; 32], [0; 32])], // zero write = cleared
             code: vec![],
             receipts: vec![(100, [2; 32], vec![]), (101, [1; 32], vec![])],
+            read_accounts: Vec::new(),
+            read_storage: Vec::new(),
         };
         let back = Frame::decode(&Frame::Diff(diff.clone()).encode().unwrap()).unwrap();
         assert_eq!(back, Frame::Diff(diff));

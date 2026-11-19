@@ -11,9 +11,10 @@
 //! task (drains the response queue, one deadline per write, flushes when
 //! the queue is empty). Database reads run on a dedicated pool of OS
 //! threads — never on async workers, the ExEx notification loop, or tokio's
-//! blocking pool (which reth's RPC shares). A job opens one state view per
-//! request frame, reads every item, encodes the response and drops the
-//! view: no provider/MDBX read transaction outlives a request. Proofs
+//! blocking pool (which reth's RPC shares). A job takes one state view per
+//! request frame, reads every item and encodes the response. In the node a
+//! view of a block is reused by later requests at that same block for up
+//! to [`VIEW_REUSE`] (1 s), then dropped with its read transaction. Proofs
 //! (op 4, D10) run the same way on a second, smaller pool, so a proof walk
 //! (ms to s) never queues ahead of point reads (µs).
 
@@ -194,15 +195,137 @@ pub fn write_multiproof(mp: &MultiProof, out: &mut ProofBuilder) {
     }
 }
 
+/// How long an opened view of one block is reused (PLAN M6). A simulation
+/// on a consumer misses one key at a time, ~100 µs apart, and opening a
+/// provider per request was a large part of each miss. A view is only
+/// reused for the same block hash, so every answer stays exact; a janitor
+/// drops views older than this, so an idle read transaction lives at most
+/// 1.5× this long.
+pub const VIEW_REUSE: Duration = Duration::from_secs(1);
+
+/// Idle views kept for reuse, at most this many (one per busy worker).
+const MAX_IDLE_VIEWS: usize = 32;
+
+/// An opened view waiting for the next request at its block.
+struct IdleView {
+    hash: Word,
+    opened: Instant,
+    view: RethView,
+}
+
+/// Parked views; `enabled` is off when there's no janitor to expire them.
+#[derive(Default)]
+struct Idle {
+    enabled: bool,
+    views: Vec<IdleView>,
+}
+
+type IdleViews = Arc<Mutex<Idle>>;
+
 /// The node's own provider (`ctx.provider()`): "latest" is the canonical
-/// head, including blocks executed but not yet persisted.
+/// head, including blocks executed but not yet persisted. Views are reused
+/// across requests for the same block for up to [`VIEW_REUSE`].
 pub struct NodeSource<P> {
     provider: P,
+    idle: IdleViews,
 }
 
 impl<P> NodeSource<P> {
-    pub const fn new(provider: P) -> Self {
-        Self { provider }
+    pub fn new(provider: P) -> Self {
+        let idle: IdleViews = Arc::default();
+        let weak = Arc::downgrade(&idle);
+        let janitor = std::thread::Builder::new()
+            .name("silt-lookup-views".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(VIEW_REUSE / 2);
+                    let Some(idle) = weak.upgrade() else { return };
+                    idle.lock()
+                        .expect("idle views lock")
+                        .views
+                        .retain(|v| v.opened.elapsed() < VIEW_REUSE);
+                }
+            });
+        match janitor {
+            Ok(_) => idle.lock().expect("idle views lock").enabled = true,
+            // Without a janitor, parked views could hold read transactions
+            // indefinitely: park none.
+            Err(err) => tracing::warn!(%err, "silt lookup: no view janitor; views not reused"),
+        }
+        Self { provider, idle }
+    }
+
+    /// An idle view of block `hash` young enough to reuse, if any.
+    fn reuse(&self, hash: &Word) -> Option<IdleView> {
+        let mut idle = self.idle.lock().expect("idle views lock");
+        let at = idle
+            .views
+            .iter()
+            .position(|v| v.hash == *hash && v.opened.elapsed() < VIEW_REUSE)?;
+        Some(idle.views.swap_remove(at))
+    }
+
+    fn view(&self, hash: Word, opened: Instant, view: RethView) -> NodeView {
+        NodeView {
+            view: Some(view),
+            hash,
+            opened,
+            home: self.idle.clone(),
+        }
+    }
+}
+
+/// A view from [`NodeSource`]: parked for reuse when the request is done,
+/// if it is still young.
+pub struct NodeView {
+    view: Option<RethView>,
+    hash: Word,
+    opened: Instant,
+    home: IdleViews,
+}
+
+impl NodeView {
+    fn inner(&self) -> &RethView {
+        self.view.as_ref().expect("view present until drop")
+    }
+}
+
+impl Drop for NodeView {
+    fn drop(&mut self) {
+        let Some(view) = self.view.take() else { return };
+        if self.opened.elapsed() >= VIEW_REUSE {
+            return;
+        }
+        let mut idle = self.home.lock().expect("idle views lock");
+        if idle.enabled && idle.views.len() < MAX_IDLE_VIEWS {
+            idle.views.push(IdleView {
+                hash: self.hash,
+                opened: self.opened,
+                view,
+            });
+        }
+    }
+}
+
+impl StateView for NodeView {
+    fn account(&self, addr: &Addr) -> Result<Option<AccountInfo>, ReadError> {
+        self.inner().account(addr)
+    }
+
+    fn storage(&self, addr: &Addr, slot: &Word) -> Result<Word, ReadError> {
+        self.inner().storage(addr, slot)
+    }
+
+    fn code(&self, code_hash: &Word) -> Result<Option<Bytes>, ReadError> {
+        self.inner().code(code_hash)
+    }
+
+    fn proof<'a>(
+        &self,
+        targets: impl Iterator<Item = ProofTarget<'a>>,
+        out: &mut ProofBuilder,
+    ) -> Result<(), ReadError> {
+        self.inner().proof(targets, out)
     }
 }
 
@@ -210,9 +333,9 @@ impl<P> StateSource for NodeSource<P>
 where
     P: StateProviderFactory + Send + Sync + 'static,
 {
-    type View = RethView;
+    type View = NodeView;
 
-    fn open(&self, pin: Option<&Word>) -> Result<Opened<RethView>, ReadError> {
+    fn open(&self, pin: Option<&Word>) -> Result<Opened<NodeView>, ReadError> {
         let Some(pin) = pin else {
             // Resolve latest to a hash first, so the response names exactly
             // what was read. A reorg between the two calls can orphan that
@@ -220,12 +343,20 @@ where
             let mut last = None;
             for _ in 0..2 {
                 let info = self.provider.chain_info().map_err(classify)?;
+                let hash = info.best_hash.0;
+                if let Some(idle) = self.reuse(&hash) {
+                    return Ok(Opened {
+                        number: info.best_number,
+                        hash,
+                        view: self.view(hash, idle.opened, idle.view),
+                    });
+                }
                 match self.provider.state_by_block_hash(info.best_hash) {
                     Ok(state) => {
                         return Ok(Opened {
                             number: info.best_number,
-                            hash: info.best_hash.0,
-                            view: RethView(state),
+                            hash,
+                            view: self.view(hash, Instant::now(), RethView(state)),
                         });
                     }
                     Err(err) => last = Some(err),
@@ -235,7 +366,8 @@ where
         };
         let hash = B256::from(*pin);
         // Canonical only: `state_by_block_hash` alone would also serve the
-        // pending block (docs/reth-notes.md).
+        // pending block (docs/reth-notes.md). Checked on every request, so
+        // a reused view is never served for a block a reorg dropped.
         let number = self
             .provider
             .block_number(hash)
@@ -244,11 +376,18 @@ where
         if self.provider.block_hash(number).map_err(classify)? != Some(hash) {
             return Err(ReadError::UnknownBlock(format!("{hash} is not canonical")));
         }
+        if let Some(idle) = self.reuse(pin) {
+            return Ok(Opened {
+                number,
+                hash: *pin,
+                view: self.view(*pin, idle.opened, idle.view),
+            });
+        }
         let state = self.provider.state_by_block_hash(hash).map_err(classify)?;
         Ok(Opened {
             number,
             hash: hash.0,
-            view: RethView(state),
+            view: self.view(*pin, Instant::now(), RethView(state)),
         })
     }
 

@@ -32,6 +32,10 @@ name = "replay"
 required-features = ["yevm"]
 
 [[example]]
+name = "sim"
+required-features = ["yevm"]
+
+[[example]]
 name = "trie-follow"
 required-features = ["trie"]
 

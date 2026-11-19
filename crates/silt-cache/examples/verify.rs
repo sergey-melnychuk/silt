@@ -56,6 +56,8 @@ struct Args {
     summary_mins: u64,
     evict_after: u64,
     concurrency: usize,
+    /// D13 read touches checked against RPC per block, per kind.
+    read_checks: usize,
 }
 
 fn args() -> eyre::Result<Args> {
@@ -65,8 +67,9 @@ fn args() -> eyre::Result<Args> {
         blocks: u64::MAX,
         hours: f64::INFINITY,
         summary_mins: 60,
-        evict_after: 64,
+        evict_after: silt_cache::DEFAULT_EVICT_AFTER_BLOCKS,
         concurrency: 16,
+        read_checks: usize::MAX,
     };
     let mut positional = 0;
     let mut it = std::env::args().skip(1);
@@ -78,6 +81,7 @@ fn args() -> eyre::Result<Args> {
             "--summary-mins" => a.summary_mins = v()?.parse()?,
             "--evict-after" => a.evict_after = v()?.parse()?,
             "--concurrency" => a.concurrency = v()?.parse()?,
+            "--read-checks" => a.read_checks = v()?.parse()?,
             flag if flag.starts_with("--") => eyre::bail!("unknown flag {flag}"),
             value => {
                 match positional {
@@ -123,7 +127,7 @@ fn rss_mib() -> f64 {
 
 enum Event {
     Diff {
-        diff: BlockDiff,
+        diff: Box<BlockDiff>,
         bytes: usize,
         received_ms: f64,
         /// At or below the server's tip at connect: a spool replay, not a
@@ -199,7 +203,7 @@ async fn stream_once(feed: &str, last: &Last, tx: &UnboundedSender<Event>) -> ey
                 *last.lock().expect("last lock") = Some((diff.number, diff.hash));
                 Event::Diff {
                     replayed: from.is_some() && diff.number <= tip,
-                    diff,
+                    diff: Box::new(diff),
                     bytes,
                     received_ms,
                 }
@@ -346,6 +350,28 @@ fn check_local(store: &Store, diff: &BlockDiff) -> Vec<String> {
         if store.slot(addr, slot, n) != Some(*value) {
             bad.push(format!(
                 "block {n} store slot {} {}",
+                hex_addr(addr),
+                hex_word(slot)
+            ));
+        }
+    }
+    // D13: a read touch never clobbers, so the store must already agree
+    // with it wherever it held the key (the feed keeps held keys current).
+    for (addr, c) in &diff.read_accounts {
+        let ok = store.account(addr, n).is_some_and(|e| {
+            e.balance == c.balance && e.nonce == c.nonce && e.code_hash == c.code_hash
+        });
+        if !ok {
+            bad.push(format!(
+                "block {n} store read-touch account {}",
+                hex_addr(addr)
+            ));
+        }
+    }
+    for (addr, slot, value) in &diff.read_storage {
+        if store.slot(addr, slot, n) != Some(*value) {
+            bad.push(format!(
+                "block {n} store read-touch slot {} {}",
                 hex_addr(addr),
                 hex_word(slot)
             ));
@@ -653,10 +679,28 @@ async fn main() -> eyre::Result<()> {
                     let want = c.as_ref().map(|c| (c.balance, c.nonce, c.code_hash));
                     futures::future::Either::Right(check_account(&rpc, n, &pin, *a, want))
                 });
-                let results: Vec<Check> = futures::stream::iter(slots.chain(accounts))
-                    .buffer_unordered(args.concurrency)
-                    .collect()
-                    .await;
+                // D13 read touches, at most `--read-checks` of each kind.
+                let read_slots =
+                    diff.read_storage
+                        .iter()
+                        .take(args.read_checks)
+                        .map(|&(a, s, v)| {
+                            futures::future::Either::Left(check_slot(&rpc, n, &pin, a, s, v))
+                        });
+                let read_accounts =
+                    diff.read_accounts
+                        .iter()
+                        .take(args.read_checks)
+                        .map(|(a, c)| {
+                            let want = Some((c.balance, c.nonce, c.code_hash));
+                            futures::future::Either::Right(check_account(&rpc, n, &pin, *a, want))
+                        });
+                let results: Vec<Check> = futures::stream::iter(
+                    slots.chain(accounts).chain(read_slots).chain(read_accounts),
+                )
+                .buffer_unordered(args.concurrency)
+                .collect()
+                .await;
                 let check_ms = t.elapsed().as_secs_f64() * 1e3;
 
                 let (mut mismatches, mut unverifiable) = (local.len() as u64, 0u64);
@@ -699,13 +743,15 @@ async fn main() -> eyre::Result<()> {
                 window.check_ms.push(check_ms);
                 rss_max = rss_max.max(rss_mib());
                 println!(
-                    "block {n} span {}..{n}{}: accounts {} slots {} code {} | {bytes} B, +{latency_ms:.0} ms, apply {apply_us:.0} µs, \
+                    "block {n} span {}..{n}{}: accounts {} slots {} code {} reads {}/{} | {bytes} B, +{latency_ms:.0} ms, apply {apply_us:.0} µs, \
                      check {check_ms:.0} ms | keys {} (total {}, mismatches {}, unverifiable {})",
                     diff.span_start,
                     if replayed { " (replay)" } else { "" },
                     diff.accounts.len(),
                     diff.storage.len(),
                     diff.code.len(),
+                    diff.read_accounts.len(),
+                    diff.read_storage.len(),
                     results.len(),
                     total.keys + window.keys,
                     total.mismatches + window.mismatches,

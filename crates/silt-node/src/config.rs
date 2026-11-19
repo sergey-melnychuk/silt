@@ -29,6 +29,10 @@ pub struct SiltConfig {
     /// at most this many blocks, each with only its own keys. 0 = no cap
     /// (one diff per segment, D6).
     pub max_span: u64,
+    /// Publish read touches (D13) when the host reports them: the keys each
+    /// block read, valued at the block, so consumer caches hold the chain's
+    /// hot set. `false` = diffs carry none (the host's sink isn't wired).
+    pub read_touches: bool,
 }
 
 impl Default for SiltConfig {
@@ -42,6 +46,7 @@ impl Default for SiltConfig {
             lookup_proof_workers: 4,
             lookup_proof_max_depth: 8,
             max_span: 32,
+            read_touches: true,
         }
     }
 }
@@ -75,6 +80,9 @@ mod tests {
         assert_eq!(cfg.max_span, 32);
         let off: SiltConfig = toml::from_str("max_span = 0").unwrap();
         assert_eq!(off.max_span, 0);
+        assert!(cfg.read_touches, "D13 on by default");
+        let off: SiltConfig = toml::from_str("read_touches = false").unwrap();
+        assert!(!off.read_touches);
     }
 
     #[test]

@@ -11,6 +11,33 @@ pub struct RpcAccount {
     pub code: Vec<u8>,
 }
 
+/// An account without its code: what a cache that already holds the code
+/// (by hash, forever) needs on a miss. `code` is set when the source had to
+/// fetch it anyway (JSON-RPC returns code, not its hash).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountMeta {
+    pub balance: Word,
+    pub nonce: u64,
+    pub code_hash: Word,
+    pub code: Option<Vec<u8>>,
+}
+
+impl AccountMeta {
+    fn from_rpc(a: RpcAccount) -> Self {
+        let code_hash = if a.code.is_empty() {
+            crate::store::KECCAK_EMPTY
+        } else {
+            crate::cache::keccak(&a.code)
+        };
+        Self {
+            balance: a.balance,
+            nonce: a.nonce,
+            code_hash,
+            code: Some(a.code),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Fallback: Send + Sync + 'static {
     /// Whole account at the given block hash (balance + nonce + code: the
@@ -23,6 +50,47 @@ pub trait Fallback: Send + Sync + 'static {
     /// Raw RPC block JSON (adapter/replay passthrough).
     async fn block_json(&self, number: u64, full: bool) -> eyre::Result<serde_json::Value>;
     async fn chain_id(&self) -> eyre::Result<u64>;
+
+    /// Accounts without their code, in `addrs` order (PLAN M6: the cache
+    /// asks for code by hash only when it doesn't hold it). The default
+    /// reads whole accounts one by one and hashes their code.
+    async fn accounts_meta_at(
+        &self,
+        addrs: &[Addr],
+        block_hash: &Word,
+    ) -> eyre::Result<Vec<AccountMeta>> {
+        let mut out = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            out.push(AccountMeta::from_rpc(
+                self.account_at(addr, block_hash).await?,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Many slots, in `keys` order. The default reads them one by one.
+    async fn storages_at(
+        &self,
+        keys: &[(Addr, Word)],
+        block_hash: &Word,
+    ) -> eyre::Result<Vec<Word>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for (addr, slot) in keys {
+            out.push(self.storage_at(addr, slot, block_hash).await?);
+        }
+        Ok(out)
+    }
+
+    /// Bytecode by hash, in `hashes` order; `None` where the source can't
+    /// answer by hash (the caller then reads the account whole). The
+    /// default can't (JSON-RPC has no code-by-hash call).
+    async fn codes_by_hash(
+        &self,
+        hashes: &[Word],
+        _block_hash: &Word,
+    ) -> eyre::Result<Vec<Option<Vec<u8>>>> {
+        Ok(vec![None; hashes.len()])
+    }
 }
 
 pub struct HttpFallback {

@@ -363,6 +363,38 @@ yevm's trait. The core crate has **no yevm dependency**.
     It depends on reth's reverts being complete, which D6's cap found they
     sometimes are not, and the warm trie would have to fetch nodes at a
     dropped block.
+- **D13 — Diffs carry read touches (2026-11-18, PLAN M6).** A diff also
+  lists the accounts and slots its blocks *read* but did not write, with
+  their values. A consumer's cache then holds what the chain is reading
+  before a simulation asks for it. Each such key would otherwise be a
+  miss: a round trip to the node, ~135 µs in M6's first run.
+  - **Where reads come from.** The host's block executor reports the keys
+    each block loaded. silt-node takes them through an optional hook
+    (`run_exex_with_reads`); a host without one publishes empty read
+    lists. In yevm-node, the executor's evm2 `CacheDB` holds every account
+    and slot the block loaded, and the keys are taken from it at block end.
+    They're keyed by (number, parent hash) in a bounded sink.
+  - **Values come from the node's own committed state, not the
+    executor.** The ExEx reads each key at the published block's post-state
+    before publishing. Any execution on the same parent, even a simulation
+    with state overrides, can only supply keys, never wrong values. Cost:
+    ~2,000 reads per block on the ExEx thread, off the import path.
+  - **What's left out.** Keys the span wrote, since the diff carries them,
+    and slots of accounts the span destroyed. Reads of a folded span are
+    the union over its blocks.
+  - **Consumers.** Read touches land like lazy fills, never clobbering, and
+    are undone by a rollback. They also refresh the last-read block of
+    entries the store already holds, so keys the chain keeps reading are
+    never evicted.
+  - **Wire.** Two trailing fields on `BlockDiff`. postcard ignores trailing
+    bytes, so older decoders read new frames unchanged. New decoders fall
+    back to the old layout for frames from an older node. `VERSION` stays
+    2 (D12's rule).
+  - **Cost.** About 600 accounts and 1,450 slots read per block, about
+    180 KB of frame, which takes the feed from ~260 KB to ~440 KB per
+    block. The store keeps the chain's hot set for the eviction age
+    (`DEFAULT_EVICT_AFTER_BLOCKS`, 2048 blocks from M6). The soft limit
+    and `mem_usage` still bound and report it (runbook §11).
 
 ## 1. Architecture
 
@@ -685,6 +717,73 @@ adds 36–61 µs to the walk for small proofs. The depth sweep set
 `proof_max_depth` to 8 (D10). As for M4, the in-node run waits for a node
 that installs silt-node.
 
+### M6 — Simulation latency vs reth's database
+
+Simulating a transaction on silt must be no slower than simulating it on
+reth's own database. The two runs use the same executor (yevm
+`Executor::run`), the same mainnet transactions and the same parent state;
+only the state source differs.
+
+- **T6.1** Workload, shared by every side. For block N+1 on state N:
+  - *per transaction*: each transaction alone on a fresh overlay, after
+    `pre_block`;
+  - *bundle*: the whole block in order.
+  
+  Real transactions stand in for what was pending at head N. The timer
+  covers `Executor::run` and the reads it makes; fetching and decoding the
+  transactions is outside it. Each sim records:
+  - its result (status, gas, output hash);
+  - its time;
+  - reads made and, on silt, cache hits, misses and time spent in misses.
+- **T6.2** **A, silt:** `Cache::from_store` holds state N, applying diff
+  N+1 only after the sims, as `replay` does. Misses go to the lookup fast
+  path pinned at N, with RPC as the fallback.
+  - *Warm*: steady state while following the feed.
+  - *Cold*: the first blocks after start.
+- **T6.3** **B1, reth's database read-only, out of process:** yevm-reth's
+  `RethDb` pinned at the datadir's state frontier F, simulating block F+1.
+  - A runs in the same process, its store held at F (subscribed from F),
+    its misses pinned at F.
+  - A and B alternate transaction by transaction, swapping which goes
+    first, so stalls hit both alike.
+  - Under `--engine.persistence-threshold 50` F trails the head by up to
+    ~35 blocks, so a read-only reader can't simulate at the head at all.
+    Report that as a finding.
+- **T6.4** **B2, reth's database inside the node:** an opt-in yevm-node
+  task simulates each new block N+1 right after import, on
+  `state_by_block_hash(N)` from the node's `BlockchainProvider` (its
+  in-memory blocks over MDBX), at the head. Its notes:
+  - A runs at the same moments in its own process (a silt-cache example,
+    no reth), built with the node's release profile.
+  - Results from the two sides are joined by (block, transaction).
+  - It needs a node build with reth stopped and a binary swap; the
+    reth-node operator does both.
+- **T6.5** Report in `docs/sim-bench.md`, for both pairings (A/B1 and
+  A/B2):
+  - per-transaction and per-bundle p50 / p99 / p999 for each side;
+  - paired A − B on the same transaction and state;
+  - A's hit rate, and its misses per transaction with their cost;
+  - cold vs warm;
+  - each sim tagged by whether it overlapped a block import or a
+    persistence batch.
+
+**Placement:** `sim-bench` (A + B1) goes in yevm-reth, which already has
+reth, yevm and silt-node. It adds silt-cache with `yevm`, and yevm's root
+patches silt-cache's yevm dependency to the local path so both sides share
+one `Chain` trait. The B2 task goes in yevm-node behind a flag. D4 is
+unchanged: silt's library crates stay free of reth and yevm.
+
+**Gates:**
+- **G6.1** Every sim gives the same result on A and on B; a difference voids
+  the latency comparison for that transaction.
+- **G6.2** Warm and paired, against both B1 and B2:
+  - A p50 ≤ B p50 and A p99 ≤ B p99;
+  - per transaction and per bundle;
+  - over at least 2,000 transactions each.
+  
+  Cold start is reported but not gated.
+- **G6.3** The report is committed to `docs/sim-bench.md`.
+
 ## 4. Feature → milestone matrix
 
 | # | Feature | Milestone |
@@ -709,6 +808,7 @@ that installs silt-node.
 | F18 | Binary proofs: op 4 layout, codec, `TooLarge`, `VERSION` 1 (D10) | M5 |
 | F19 | Proof pool, depth bound, `LookupClient::proof` | M5 |
 | F20 | Proof bench (byte-exact vs reth) + `eth_getProof` verify | M5 |
+| F21 | Simulation latency vs reth's database (read-only and in-node) | M6 |
 
 ## 5. VERIFY before coding (facts, not assumptions)
 
