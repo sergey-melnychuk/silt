@@ -167,7 +167,14 @@ where
                     continue;
                 }
                 if let Some(reads) = &reads {
-                    diff = with_reads(ctx.provider().clone(), reads.as_ref(), &chain, diff).await;
+                    diff = with_reads(
+                        ctx.provider().clone(),
+                        reads.as_ref(),
+                        &chain,
+                        diff,
+                        std::time::Duration::from_millis(cfg.read_fill_budget_ms),
+                    )
+                    .await;
                     if diff.number.is_multiple_of(300) {
                         log_read_stats(reads.as_ref());
                     }
@@ -196,10 +203,14 @@ where
 static FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FILL_US_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FILL_US_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Block read keys the fill budget left out, and D14 pending touches added.
+static FILL_CUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PENDING_ADDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Logs one INFO line about read touches: the source's counters (keys per
-/// block, collect time on the import path, drops, ignored executions) and
-/// the fill time this ExEx added before publishing.
+/// block, collect time on the import path, drops, ignored executions, the
+/// pool worker's passes) and what this ExEx added before publishing: fill
+/// time, keys the fill budget left out, pending touches published.
 fn log_read_stats(reads: &dyn reads::ReadTouches) {
     use std::sync::atomic::Ordering::Relaxed;
     let fills = FILLS.swap(0, Relaxed);
@@ -210,23 +221,29 @@ fn log_read_stats(reads: &dyn reads::ReadTouches) {
         fills,
         fill_ms_avg = sum as f64 / 1e3 / fills.max(1) as f64,
         fill_ms_max = max as f64 / 1e3,
+        fill_cut_keys = FILL_CUT.swap(0, Relaxed),
+        pending_published = PENDING_ADDED.swap(0, Relaxed),
         "silt: read touches"
     );
 }
 
-/// D13: the span's reported read keys, valued at the diff's block on a
-/// blocking thread. Optional data: on any failure the diff goes out
-/// without them.
+/// D13 and D14: the span's reported block read keys, valued at the diff's
+/// block on a blocking thread within `budget`; then the pending touches
+/// read on the diff's parent, which need no read. Optional data: on any
+/// failure the diff goes out without them.
 async fn with_reads<P>(
     provider: P,
     reads: &dyn reads::ReadTouches,
     chain: &reth_ethereum::provider::Chain<EthPrimitives>,
     mut diff: silt_wire::BlockDiff,
+    budget: std::time::Duration,
 ) -> silt_wire::BlockDiff
 where
     P: StateProviderFactory + Send + Sync + 'static,
 {
     use reth_ethereum::primitives::AlloyBlockHeader;
+    use std::sync::atomic::Ordering::Relaxed;
+    let pending = reads.take_pending(diff.number, &diff.parent_hash);
     let mut keys = reads::ReadKeys::default();
     for block in chain.blocks_iter() {
         let number = block.header().number();
@@ -244,39 +261,43 @@ where
             keys.extend(k);
         }
     }
-    if keys.is_empty() {
-        return diff;
-    }
-    let started = std::time::Instant::now();
     let number = diff.number;
-    // The task gets a copy: whatever happens to it, `diff` still goes out.
-    let mut copy = diff.clone();
-    let filled = tokio::task::spawn_blocking(move || {
-        reads::fill_reads(&provider, &mut copy, keys).map(|()| copy)
-    })
-    .await;
-    match filled {
-        Ok(Ok(filled)) => {
-            let us = started.elapsed().as_micros() as u64;
-            FILL_US_SUM.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
-            FILL_US_MAX.fetch_max(us, std::sync::atomic::Ordering::Relaxed);
-            FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(
-                number,
-                accounts = filled.read_accounts.len(),
-                slots = filled.read_storage.len(),
-                ms = us as f64 / 1e3,
-                "silt: read touches filled"
-            );
-            diff.read_accounts = filled.read_accounts;
-            diff.read_storage = filled.read_storage;
+    if !keys.is_empty() {
+        let started = std::time::Instant::now();
+        // The task gets a copy: whatever happens to it, `diff` still goes out.
+        let mut copy = diff.clone();
+        let filled = tokio::task::spawn_blocking(move || {
+            reads::fill_reads(&provider, &mut copy, keys, budget).map(|cut| (copy, cut))
+        })
+        .await;
+        match filled {
+            Ok(Ok((filled, cut))) => {
+                let us = started.elapsed().as_micros() as u64;
+                FILL_US_SUM.fetch_add(us, Relaxed);
+                FILL_US_MAX.fetch_max(us, Relaxed);
+                FILLS.fetch_add(1, Relaxed);
+                FILL_CUT.fetch_add(cut, Relaxed);
+                tracing::debug!(
+                    number,
+                    accounts = filled.read_accounts.len(),
+                    slots = filled.read_storage.len(),
+                    cut,
+                    ms = us as f64 / 1e3,
+                    "silt: read touches filled"
+                );
+                diff.read_accounts = filled.read_accounts;
+                diff.read_storage = filled.read_storage;
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(number, %err, "silt: read touches not filled; publishing without");
+            }
+            Err(err) => {
+                tracing::error!(number, %err, "silt: read-touch fill panicked; publishing without");
+            }
         }
-        Ok(Err(err)) => {
-            tracing::warn!(number, %err, "silt: read touches not filled; publishing without");
-        }
-        Err(err) => {
-            tracing::error!(number, %err, "silt: read-touch fill panicked; publishing without");
-        }
+    }
+    if !pending.is_empty() {
+        PENDING_ADDED.fetch_add(reads::merge_pending(&mut diff, pending) as u64, Relaxed);
     }
     diff
 }

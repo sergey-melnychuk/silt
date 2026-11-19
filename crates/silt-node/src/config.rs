@@ -33,6 +33,14 @@ pub struct SiltConfig {
     /// block read, valued at the block, so consumer caches hold the chain's
     /// hot set. `false` = diffs carry none (the host's sink isn't wired).
     pub read_touches: bool,
+    /// Most time the ExEx spends reading block read-touch values (D13)
+    /// before publishing a diff; keys past it are left out (counted in the
+    /// stats line). Bounds the publish delay when the disk stalls.
+    pub read_fill_budget_ms: u64,
+    /// Pending read touches (D14): the host runs pool transactions on the
+    /// head and the next diff carries what they read. Needs
+    /// `read_touches`; `false` = the host's pool worker doesn't start.
+    pub pending_reads: bool,
 }
 
 impl Default for SiltConfig {
@@ -47,6 +55,8 @@ impl Default for SiltConfig {
             lookup_proof_max_depth: 8,
             max_span: 32,
             read_touches: true,
+            read_fill_budget_ms: 50,
+            pending_reads: true,
         }
     }
 }
@@ -83,6 +93,7 @@ mod tests {
         assert!(cfg.read_touches, "D13 on by default");
         let off: SiltConfig = toml::from_str("read_touches = false").unwrap();
         assert!(!off.read_touches);
+        assert_eq!((cfg.read_fill_budget_ms, cfg.pending_reads), (50, true));
     }
 
     #[test]

@@ -91,6 +91,24 @@ block import; soak 2's 7 s p99 is the cleaner figure.
   A 15-block `verify` right after (18:46–18:49 UTC) checked 19,522 keys,
   0 mismatches: the first check of reads at the newest block under
   `--engine.persistence-threshold 50`.
-- Still to show live: a consumer connected *through* a node restart under
-  load. No consumer was connected across the 11-18 restart, and soak 1
-  ended before its node came back.
+- **Live, a consumer connected through a restart (G3.2), 2026-11-19.** Soak
+  3's `verify` stayed connected while the node was stopped and replaced by
+  a new build (silt `9df61c2`, D13).
+  - The node stopped at 07:55:10 UTC. The feed was down from the last old
+    diff (26447764, 07:55:04) to the first new one (08:08:30), about
+    13.5 min; `verify` retried with backoff meanwhile.
+  - At startup the node rolled back to 26447728. It was the first restart
+    under state masking, and the persisted state lagged the blocks. It
+    re-executed from there, so the new process re-published blocks
+    `verify` already held. The consumer side handled them as designed:
+    `STALE: diff 26447743 already applied; skipped`, then
+    `OVERLAP: span 26447744..26447775 passes through our tip (node
+    restart); applied`. That span's 20,680 keys were checked against RPC,
+    0 mismatches, with no break and no drop to cold.
+  - This `verify` predates D13. From 26447832 on, the new node's diffs
+    carry read touches (183 accounts and 812 slots in that first block),
+    and the old decoder kept reading them unchanged.
+  - A second restart the same morning, 10:15–10:21 UTC (the same build
+    without the in-node simulation task), went the same way. Two stale
+    spans (to 26448445 and 26448461) were skipped, then `OVERLAP: span
+    26448462..26448493` was applied: 22,925 keys checked, 0 mismatches.

@@ -395,6 +395,47 @@ yevm's trait. The core crate has **no yevm dependency**.
     block. The store keeps the chain's hot set for the eviction age
     (`DEFAULT_EVICT_AFTER_BLOCKS`, 2048 blocks from M6). The soft limit
     and `mem_usage` still bound and report it (runbook §11).
+  - **Budget (2026-11-19).** Block read values are filled within
+    `read_fill_budget_ms` (default 50). Keys past it are left out and
+    counted, so a disk stall during a batch commit can't hold a diff back.
+    One fill took 1.8 s before the budget existed.
+- **D14 — Diffs carry pending read touches (2026-11-19, PLAN M6; the
+  user's decision).** After D13 and the lookup view reuse, a miss costs
+  ~57 µs on localhost (more across the rack) and silt misses ~2.3 times
+  per transaction. Most misses are first reads by new transactions: keys
+  no recent block read. Those are exactly what a simulator of pending
+  transactions hits, so the node publishes what its pool's pending
+  transactions read.
+  - **Where.** The host runs a pool worker off the import path. In
+    yevm-node, the "yevm-pending" ExEx hands each new head to one thread.
+    That thread runs at nice 10 with the idle I/O class, since its reads
+    are mostly cold page faults that must not queue ahead of import.
+  - **What it does on each head.** It opens that block's state once. It
+    runs up to 2,000 of the pool's best transactions with yevm on fresh
+    overlays, in the next block's environment, for at most 500 ms, and
+    records every account and slot read *with its value*. The keys go to
+    `ReadTouchSink::add_pending`, at most 20,000 held.
+  - **Publishing.** The diff of block N takes the touches read on its
+    parent N−1. It skips the ones block N wrote, since the diff carries
+    their new values. Unwritten, their value at N−1 is their value at N,
+    so they're published with no read at all.
+    - Touches read on any other head (a late pass, a fork) are dropped.
+    - A key published within the last 64 blocks isn't published again.
+      Consumers hold it, and the diffs keep its value current. Re-sending
+      after that keeps it from aging out while the pool keeps reading it.
+  - **Why values from the worker are fine here (unlike D13's keys).** The
+    worker reads the node's own state, never a caller's, so no RPC path
+    can inject values.
+  - **Wire.** The same `read_accounts` / `read_storage` fields carry them.
+    Their meaning ("keys the span didn't write, valued at `number`") fits
+    as it is.
+  - **Stats.** The ExEx's "silt: read touches" line covers the passes,
+    transactions run, ms per pass, keys collected, dropped at the cap,
+    stale, skipped as recent, and handed to diffs, and the pending touches
+    published. `silt.toml pending_reads = false` turns the worker off.
+  - Not chosen: reusing reth's prewarm. Its results live inside the
+    engine's payload processor, cover only the block's own transactions,
+    and aren't exposed.
 
 ## 1. Architecture
 
