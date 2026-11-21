@@ -13,6 +13,74 @@ disk shows up in them (soak 1, below).
 Latency is *block timestamp → diff received*: it includes the block's
 propagation to the node and its import, not only silt's publish.
 
+## Soak 3: memory after the eviction fix, through three node restarts (24 h, 0 mismatches)
+
+2026-11-18 19:30:10 UTC → 2026-11-19 19:30 UTC. `verify` from silt
+`49f5a75`, which includes the eviction fix `882d5c9`. Eviction after 64
+blocks, 16 calls in flight. The node was replaced under it three times
+(restarts, below):
+
+| from (UTC) | node | silt in the node |
+|---|---|---|
+| start | yevm-node `aaae0322`, persistence threshold 50 | `f701f02` (D12) |
+| 11-19 08:03 | `d2530e51`, with the in-node simulation task | `9df61c2` (D13 read touches) |
+| 10:21 | the same build, without that task | `9df61c2` |
+| 11:20 | `8653babd` | `673bfbe` (D14 pending read touches) |
+
+This `verify` predates D13. It decodes the read-touch fields away and
+checks only the keys each diff wrote. The read touches themselves are
+checked by the run that follows.
+
+| metric | value |
+|---|---|
+| duration | 24.00 h |
+| blocks (diffs) | 7,214 (7,015) |
+| keys checked | 8,988,443 |
+| mismatches | **0** |
+| unverifiable keys | 0 |
+| reconnects / gaps / reorgs / breaks | 1,844 / 0 / 3 / 0 |
+| reorgs rolled back (dropped-block keys checked at the fork) | 3 (620), 0 mismatched |
+| re-deliveries after a node restart: overlapping spans / stale diffs | 3 / 5 |
+| block timestamp → diff received, ms p50 / p99 / max | 2,199 / 6,100 / 39,980 |
+| frame bytes per block p50 / p99 / max | 312,048 / 753,284 / 1,005,169 |
+| feed volume | 2,233 MiB/day |
+| store apply µs p50 / p99 / max | 722 / 1,938 / 9,211 |
+| check ms per block p50 / p99 / max | 72 / 157 / 12,816 |
+| store at end | 12,913 accounts, 27,078 slots |
+| RSS at end / max | 181 / 181 MiB |
+
+Every hourly window had 0 mismatches. The 3 reorgs were each one block
+deep (forks at 26444491, 26446374 and 26447417). All 1,844 reconnects fell
+inside the three restart windows.
+
+- **Latency outliers.** The two worst latencies (40 s and 26 s) were blocks
+  whose import in the node took 35 s (03:02 UTC) and 13 s (04:17 UTC).
+- **Check maximum.** The 12.8 s check was the 31-block span re-delivered
+  after the third restart.
+
+**Feed size with read touches.** Before D13, diffs ran 237–266 KB per block
+(hourly p50s), or 72–78 MiB an hour. From the D13 node on, they ran
+349–433 KB per block, or 99–121 MiB an hour. That is about 40% more, close
+to 2.7 GB a day; soak 2 averaged 79 MiB an hour without read touches.
+
+**Memory.**
+- RSS by hour (MiB): 55, 60, 67, 63, 73, 72, 81, 82, 89, 82, 88, 89, 107,
+  102, 122, 140, 153, 156, 166, 171, 177, 180, 181, 181.
+- **Hours 1–12** match soak 2's window with the eviction fix: 89 MiB at
+  12 h against 123.
+- **Hours 13–24.** RSS rose again from hour 13 and stopped at 180–181 MiB
+  for the last three hours.
+  - The store did not grow: it held 9.5k–16.1k accounts and 26k–41k slots
+    in every hour of the run. The growth is in `verify`'s own heap.
+  - It began with the first restart and continued through hours 17–22,
+    which had no restart.
+  - Two things changed at hour 13: catch-up spans of 7–9 MB after each
+    restart, and diffs about 40% larger, carrying read touches this
+    `verify` decodes away.
+  - Neither was measured as the cause.
+- The run after this one (the current `verify`, eviction after 2,048
+  blocks) shows whether it repeats.
+
 ## Soak 2: the G3.1 window (24 h, 0 mismatches)
 
 2026-11-17 18:11:12 UTC → 2026-11-18 18:11 UTC. Node: yevm-node `aaae0322`
@@ -50,8 +118,8 @@ growth. Fixed in `882d5c9`, measured offline by replaying 350 recorded
 blocks through both stores: the index stays flat at ~2,300 sets and the
 heap grows 0.8 MiB instead of 2.3 MiB over 45 minutes of mainnet. The rest
 of the growth is in `verify` itself (RPC client, tasks, allocator) and is
-unmeasured. Soak 3 repeats this window with the fix to show the RSS curve;
-consumer guidance is in `docs/runbook.md` §11.
+unmeasured. Soak 3 (above) repeats this window with the fix; consumer
+guidance is in `docs/runbook.md` §11.
 
 ## Soak 1: stopped at 4.16 h (0 mismatches)
 
@@ -112,3 +180,11 @@ block import; soak 2's 7 s p99 is the cleaner figure.
     without the in-node simulation task), went the same way. Two stale
     spans (to 26448445 and 26448461) were skipped, then `OVERLAP: span
     26448462..26448493` was applied: 22,925 keys checked, 0 mismatches.
+  - A third, 11:11–11:26 UTC, brought in D14 (node `8653babd`, silt
+    `673bfbe`). The feed was down from the last old diff (26448741,
+    11:11:14) to the first new one (11:25:56), about 15 min. The new node
+    re-published from 26448699. `verify` skipped two stale spans (to
+    26448700 and 26448732) and applied `OVERLAP: span 26448733..26448763`:
+    21,386 keys checked, 0 mismatches.
+  - Over the whole of soak 3: 3 restarts, 5 stale diffs skipped, 3
+    overlapping spans applied, 0 gaps, 0 breaks, no drop to cold.
