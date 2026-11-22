@@ -462,6 +462,32 @@ mod tests {
         );
     }
 
+    /// PLAN D15: the node published 8a early, then restarted before the
+    /// consensus client chose 8b. The new process doesn't know about 8a, so
+    /// it publishes 8b (alone, folded into a catch-up span, or as 9's
+    /// parent) with no `Reorg`. The hashes don't match the store's, so each
+    /// is a break: the store goes cold rather than keep what only 8a wrote.
+    #[test]
+    fn sibling_of_an_early_tip_after_a_node_restart_breaks() {
+        let store = Store::new(16);
+        for n in 5..=7u8 {
+            store.apply(&diff(n as u64, n, n - 1));
+        }
+        store.apply(&diff(8, 0x8a, 7));
+        assert_eq!(continuity(&store, &diff(8, 0x8b, 7)), Continuity::Break);
+        // 8b's hash at 8 here is 8 ^ 0x80; ending at 8, or catching up past it.
+        assert_eq!(
+            continuity(&store, &folded(6, 8, Some(8))),
+            Continuity::Break
+        );
+        assert_eq!(
+            continuity(&store, &folded(6, 9, Some(8))),
+            Continuity::Break
+        );
+        assert_eq!(continuity(&store, &diff(9, 9, 0x8b)), Continuity::Break);
+        assert_eq!(continuity(&store, &diff(8, 0x8a, 7)), Continuity::Stale);
+    }
+
     /// After a node restart the spool can start with a folded span that
     /// began below our tip: it applies without a break, and the heads ring
     /// doesn't repeat the blocks we already had.

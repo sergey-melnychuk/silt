@@ -44,7 +44,14 @@ lookup_workers = 16            # OS threads for point reads
 lookup_proof_workers = 4       # OS threads for proofs (never queue ahead of reads)
 lookup_proof_max_depth = 8     # proofs pinned deeper below the head answer UnknownBlock
 max_span = 32                  # most blocks per diff while catching up; 0 = one diff per segment
+read_touches = true            # diffs carry what each block read, with its values (PLAN D13/D15)
+pending_reads = true           # and what the pool's pending transactions read (D14; host's worker)
+early_publish = true           # publish each block once validated, before it is canonical (D15)
 ```
+
+`early_publish` and the read touches need the host's hooks (yevm-node has
+them). A `read_fill_budget_ms` line from before D15 must go: unknown
+fields stop the node.
 
 **Binding (D1).** Neither listener authenticates or encrypts.
 - Keep `lookup_bind` on loopback. It serves arbitrary state and proof reads,

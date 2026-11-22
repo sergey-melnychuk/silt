@@ -370,12 +370,13 @@ yevm's trait. The core crate has **no yevm dependency**.
   miss: a round trip to the node, ~135 µs in M6's first run.
   - **Where reads come from.** The host's block executor reports the keys
     each block loaded. silt-node takes them through an optional hook
-    (`run_exex_with_reads`); a host without one publishes empty read
-    lists. In yevm-node, the executor's evm2 `CacheDB` holds every account
+    (`run_exex_with_reads`, now `run_exex_with`); a host without one
+    publishes empty read lists. In yevm-node, the executor's evm2 `CacheDB` holds every account
     and slot the block loaded, and the keys are taken from it at block end.
     They're keyed by (number, parent hash) in a bounded sink.
   - **Values come from the node's own committed state, not the
-    executor.** The ExEx reads each key at the published block's post-state
+    executor** (until D15, which takes them from the engine's own
+    execution, guarded by a ticket, and drops this read). The ExEx reads each key at the published block's post-state
     before publishing. Any execution on the same parent, even a simulation
     with state overrides, can only supply keys, never wrong values. Cost:
     ~2,000 reads per block on the ExEx thread, off the import path.
@@ -395,10 +396,10 @@ yevm's trait. The core crate has **no yevm dependency**.
     block. The store keeps the chain's hot set for the eviction age
     (`DEFAULT_EVICT_AFTER_BLOCKS`, 2048 blocks from M6). The soft limit
     and `mem_usage` still bound and report it (runbook §11).
-  - **Budget (2026-11-19).** Block read values are filled within
-    `read_fill_budget_ms` (default 50). Keys past it are left out and
-    counted, so a disk stall during a batch commit can't hold a diff back.
-    One fill took 1.8 s before the budget existed.
+  - **Budget (2026-11-19; removed with the fill by D15).** Block read
+    values are filled within `read_fill_budget_ms` (default 50). Keys past
+    it are left out and counted, so a disk stall during a batch commit
+    can't hold a diff back. One fill took 1.8 s before the budget existed.
 - **D14 — Diffs carry pending read touches (2026-11-19, PLAN M6; the
   user's decision).** After D13 and the lookup view reuse, a miss costs
   ~57 µs on localhost (more across the rack) and silt misses ~2.3 times
@@ -436,6 +437,80 @@ yevm's trait. The core crate has **no yevm dependency**.
   - Not chosen: reusing reth's prewarm. Its results live inside the
     engine's payload processor, cover only the block's own transactions,
     and aren't exposed.
+- **D15 — Publish at execution (2026-11-21, PLAN M6; the user's
+  decision).** The node's log over 7,426 blocks (2026-11-20/21) showed a
+  block reaching the feed 176 ms (p50) / 2.3 s (p99) after the engine had
+  executed and validated it. Two steps added up to that:
+  - **Waiting for the consensus client: 114 ms / 2.2 s.** An ExEx only
+    hears about canonical blocks, so silt waited for `forkchoiceUpdated`.
+  - **Canonical to publish: 63 ms / 1.05 s, worst 8.3 s.** reth's ExEx
+    manager writes every notification to its WAL, with an fsync, before
+    delivering it. silt then read the D13 values back through the
+    provider: 16–48 ms on average, up to 3 s on SATA.
+
+  Meanwhile the node serves the block's state from memory as soon as it is
+  validated, and writes it to its database ~50 blocks later. The goal: silt
+  has the block before anything touches the disk.
+  - **Where it comes from.** reth's engine emits
+    `CanonicalBlockAdded(ExecutedBlock)` right after it executes and
+    validates a block above the canonical head, state root included. That
+    is before it answers `newPayload`. The block's receipts and state
+    changes come with it, in memory.
+    - The host forwards these events to the ExEx. yevm-node subscribes to
+      `engine_events` after launch.
+    - The ExEx builds the diff with `mapping::diff_from_executed`, the same
+      fold as for a committed chain, and publishes it at once.
+    - No WAL, no wait for `forkchoiceUpdated`, no disk read.
+  - **Only continuing the published chain.** An early block is published
+    only if its parent is the last block published. After a start, the
+    first diff always comes from the ExEx.
+  - **The ExEx stays the backstop.** It still publishes whatever the early
+    path didn't: a skipped event, or blocks synced from the network after
+    a restart. It still splits catch-up segments and acks `FinishedHeight`.
+    A committed block already published early, with the same number and
+    hash, is skipped.
+  - **An early block that doesn't become canonical.** Suppose the ExEx
+    commits a block at a height already published with another hash,
+    because the consensus client chose a sibling. silt then sends `Reorg`
+    to the fork below it, and then the committed block: D12's rollback.
+    The same happens when an ExEx reorg drops early blocks above the old
+    tip. Over the 7,426 blocks measured, every block validated above the
+    head became canonical.
+  - **Read values from the engine's own execution (replaces D13's fill and
+    its budget).**
+    - The executor already holds every value it loaded. After the block,
+      its cache holds the block's post-state. For a key the block didn't
+      write, that is also the value before it.
+    - The executor hands keys *with values* to the sink, so nothing is
+      read back.
+    - **D13's guarantee that no caller can inject values now rests on a
+      ticket.** `ReadTouchSink::expect` runs in `context_for_payload`,
+      which only the engine's payload validator calls. It leaves a
+      per-thread ticket naming (number, parent, transactions).
+    - reth creates the executor for that payload right after, on the same
+      thread, and the executor claims the ticket. At the end it reports
+      the block it actually executed, and the sink accepts values only
+      when that matches the ticket.
+    - RPC executions never call `context_for_payload`, so they never hold
+      a ticket.
+    - `read_fill_budget_ms` is gone. Remove it from `silt.toml`: unknown
+      fields are an error.
+  - **Wire.** Unchanged: the same `Diff` and `Reorg` frames. `VERSION`
+    stays 2.
+  - **Config and stats.**
+    - `early_publish` (default true); false restores ExEx-only
+      publishing.
+    - The "silt: publish" stats line, every 300 blocks, counts diffs by
+      path: early, ExEx, and committed blocks skipped as already published.
+    - It also counts early blocks skipped for not continuing the chain,
+      early blocks dropped by a reorg, and the lag from the engine event to
+      publish (average and max).
+  - Not chosen yet:
+    - Publishing at the end of execution, before the state-root check.
+      That would save the state-root time, but a block that then failed
+      validation would already be out. Measure first.
+    - Starting D14's pool worker from the early event too, which would
+      give it ~176 ms more per block.
 
 ## 1. Architecture
 

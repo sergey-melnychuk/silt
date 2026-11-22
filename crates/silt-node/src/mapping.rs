@@ -13,10 +13,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use alloy_primitives::{Address, B256, U256};
-use reth_ethereum::EthPrimitives;
-use reth_ethereum::primitives::AlloyBlockHeader;
-use reth_ethereum::provider::{Chain, ExecutionOutcome};
+use reth_ethereum::primitives::{AlloyBlockHeader, RecoveredBlock, SealedHeader};
+use reth_ethereum::provider::{BlockExecutionOutput, Chain, ExecutionOutcome};
 use reth_ethereum::trie::bundle_state::BundleState;
+use reth_ethereum::{Block, EthPrimitives, Receipt};
 use silt_wire::{AccountChange, BlockDiff, HeadLite, LogLite, ReceiptLite, Word};
 
 fn word(v: &B256) -> Word {
@@ -222,47 +222,77 @@ fn chunk(bundle: &BundleState, first: u64, start: u64, end: u64) -> Chunk {
 type Receipts = Vec<(u64, Word, Vec<ReceiptLite>)>;
 
 fn heads_and_receipts(chain: &Chain<EthPrimitives>) -> eyre::Result<(Vec<HeadLite>, Receipts)> {
-    let mut heads = Vec::new();
-    for header in chain.headers() {
-        heads.push(HeadLite {
-            number: header.number(),
-            hash: word(&header.hash()),
-            parent_hash: word(&header.parent_hash()),
-            timestamp: header.timestamp(),
-            basefee: word_u256(&U256::from(header.base_fee_per_gas().unwrap_or(0))),
-            gas_limit: header.gas_limit(),
-            coinbase: header.beneficiary().0.0,
-            prevrandao: header.mix_hash().map(|h| word(&h)).unwrap_or_default(),
-        });
-    }
+    let heads: Vec<HeadLite> = chain.headers().map(|h| head_lite(&h)).collect();
     eyre::ensure!(!heads.is_empty(), "committed chain with no headers");
-
-    let mut receipts = Vec::new();
-    for (block, block_receipts) in chain.blocks_and_receipts() {
-        let lite = block
-            .body()
-            .transactions
-            .iter()
-            .zip(block_receipts.iter())
-            .map(|(tx, r)| ReceiptLite {
-                tx_hash: word(tx.tx_hash()),
-                success: r.success,
-                cumulative_gas_used: r.cumulative_gas_used,
-                logs: r
-                    .logs
-                    .iter()
-                    .map(|log| LogLite {
-                        address: log.address.0.0,
-                        topics: log.topics().iter().map(word).collect(),
-                        data: log.data.data.to_vec(),
-                    })
-                    .collect(),
-            })
-            .collect();
-        receipts.push((block.number(), word(&block.hash()), lite));
-    }
-
+    let receipts = chain
+        .blocks_and_receipts()
+        .map(|(block, block_receipts)| {
+            (
+                block.number(),
+                word(&block.hash()),
+                receipts_lite(block, block_receipts),
+            )
+        })
+        .collect();
     Ok((heads, receipts))
+}
+
+fn head_lite(header: &SealedHeader) -> HeadLite {
+    HeadLite {
+        number: header.number(),
+        hash: word(&header.hash()),
+        parent_hash: word(&header.parent_hash()),
+        timestamp: header.timestamp(),
+        basefee: word_u256(&U256::from(header.base_fee_per_gas().unwrap_or(0))),
+        gas_limit: header.gas_limit(),
+        coinbase: header.beneficiary().0.0,
+        prevrandao: header.mix_hash().map(|h| word(&h)).unwrap_or_default(),
+    }
+}
+
+fn receipts_lite(block: &RecoveredBlock<Block>, receipts: &[Receipt]) -> Vec<ReceiptLite> {
+    block
+        .body()
+        .transactions
+        .iter()
+        .zip(receipts.iter())
+        .map(|(tx, r)| ReceiptLite {
+            tx_hash: word(tx.tx_hash()),
+            success: r.success,
+            cumulative_gas_used: r.cumulative_gas_used,
+            logs: r
+                .logs
+                .iter()
+                .map(|log| LogLite {
+                    address: log.address.0.0,
+                    topics: log.topics().iter().map(word).collect(),
+                    data: log.data.data.to_vec(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Maps one block the engine executed and validated, before it is
+/// canonical (D15), into a wire diff: the same fold as a committed one-block
+/// chain, straight from the engine's in-memory output.
+pub fn diff_from_executed(
+    block: &RecoveredBlock<Block>,
+    output: &BlockExecutionOutput<Receipt>,
+) -> eyre::Result<BlockDiff> {
+    let (accounts, storage, code) = fold_bundle(&output.state);
+    let receipts = vec![(
+        block.number(),
+        word(&block.hash()),
+        receipts_lite(block, &output.result.receipts),
+    )];
+    assemble(
+        vec![head_lite(&block.clone_sealed_header())],
+        receipts,
+        accounts,
+        storage,
+        code,
+    )
 }
 
 fn assemble(
@@ -489,5 +519,63 @@ mod tests {
             .find(|(_, k, _)| U256::from_be_bytes(*k) == U256::from(6))
             .unwrap();
         assert_eq!(U256::from_be_bytes(written.2), U256::from(42));
+    }
+
+    /// D15: a block the engine executed maps to the same diff as the
+    /// one-block chain the ExEx gets for it once canonical.
+    #[test]
+    fn executed_block_maps_like_its_committed_chain() {
+        use reth_ethereum::primitives::Header;
+        use reth_ethereum::provider::BlockExecutionResult;
+
+        let header = Header {
+            number: 7,
+            parent_hash: B256::repeat_byte(6),
+            timestamp: 84,
+            base_fee_per_gas: Some(9),
+            gas_limit: 36_000_000,
+            ..Default::default()
+        };
+        let block = RecoveredBlock::new_unhashed(
+            Block {
+                header,
+                body: Default::default(),
+            },
+            vec![],
+        );
+        let mut bundle = BundleState::default();
+        bundle
+            .state
+            .insert(Address::with_last_byte(1), acct(7, 3, &[(5, 0), (6, 42)]));
+        bundle.state.insert(
+            Address::with_last_byte(2),
+            BundleAccount {
+                info: None,
+                original_info: None,
+                storage: Default::default(),
+                status: AccountStatus::Destroyed,
+            },
+        );
+        let output = BlockExecutionOutput::new(
+            BlockExecutionResult {
+                receipts: vec![],
+                requests: Default::default(),
+                gas_used: 0,
+                blob_gas_used: 0,
+            },
+            bundle.clone(),
+        );
+        let chain = Chain::<EthPrimitives>::new(
+            [block.clone()],
+            ExecutionOutcome::new(bundle, vec![vec![]], 7, vec![]),
+            BTreeMap::new(),
+        );
+
+        let early = diff_from_executed(&block, &output).unwrap();
+        assert_eq!(early, diff_from_chain(&chain).unwrap());
+        assert_eq!((early.span_start, early.number), (7, 7));
+        assert_eq!(early.hash, block.hash().0);
+        assert_eq!(early.parent_hash, [6; 32]);
+        assert_eq!(early.receipts.len(), 1);
     }
 }
