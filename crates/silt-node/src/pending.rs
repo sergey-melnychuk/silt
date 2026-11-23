@@ -65,7 +65,13 @@ where
 }
 
 /// Lowers the calling thread's priority: CPU nice 10, idle I/O class
+/// (Linux: per thread). Elsewhere the thread keeps the default priority.
+#[cfg(not(target_os = "linux"))]
+fn lower_priority() {}
+
+/// Lowers the calling thread's priority: CPU nice 10, idle I/O class
 /// (Linux: per thread).
+#[cfg(target_os = "linux")]
 fn lower_priority() {
     // SAFETY: plain syscalls on the calling thread's own id.
     unsafe {
