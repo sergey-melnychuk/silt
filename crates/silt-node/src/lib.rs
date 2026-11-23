@@ -57,12 +57,12 @@ pub use config::SiltConfig;
 pub use rpc::{SiltApiServer, SiltRpc};
 
 use futures::TryStreamExt;
-use reth_ethereum::pool::{PoolTransaction, TransactionPool};
-use reth_ethereum::{EthPrimitives, TransactionSigned};
 use reth_ethereum::chainspec::{ChainSpec, EthChainSpec};
 use reth_ethereum::exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_ethereum::node::api::{FullNodeComponents, NodeTypes};
+use reth_ethereum::pool::{PoolTransaction, TransactionPool};
 use reth_ethereum::provider::StateProviderFactory;
+use reth_ethereum::{EthPrimitives, TransactionSigned};
 
 /// `silt_multiproof` (D8) as a jsonrpsee module, for `extend_rpc_modules`:
 /// `ctx.modules.merge_configured(rpc_module(ctx.provider().clone()))`. It is
