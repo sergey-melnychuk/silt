@@ -18,13 +18,16 @@ silt runs **inside** a reth node; there is no separate silt process.
 
 Two ways to get a node with silt:
 
-- **`silt-exex`** (this repo): stock reth plus silt. Same CLI, same
-  datadir, same flags as the `reth` it replaces.
+- **`silt-exex`** (this repo): stock reth plus silt (PLAN D16). Same CLI,
+  same datadir, same flags, same evm2 executor and build features as the
+  `reth` it replaces, and the two can take turns on one datadir. It
+  publishes each block at execution (D15) with its read touches (D13).
 - **Any other reth-based node** adds silt-node with two calls on reth's
   node launcher: `install_exex("silt", |ctx| Ok(silt_node::run_exex(ctx, cfg)))`
   and, in `extend_rpc_modules`,
-  `ctx.modules.merge_configured(silt_node::rpc_module(ctx.provider().clone()))`
-  (see `crates/silt-node/src/lib.rs`).
+  `ctx.modules.merge_configured(silt_node::rpc_module(ctx.provider().clone()))`.
+  Read touches and early publishing take two more steps: see
+  `crates/silt-node/src/lib.rs` and `crates/silt-exex/src/main.rs`.
 
 silt never writes to the node's database. The ExEx acks each block to
 reth only after the diff is in its in-memory spool (D5), so a slow or dead
@@ -44,14 +47,16 @@ lookup_workers = 16            # OS threads for point reads
 lookup_proof_workers = 4       # OS threads for proofs (never queue ahead of reads)
 lookup_proof_max_depth = 8     # proofs pinned deeper below the head answer UnknownBlock
 max_span = 32                  # most blocks per diff while catching up; 0 = one diff per segment
-read_touches = true            # diffs carry what each block read, with its values (PLAN D13/D15)
-pending_reads = true           # and what the pool's pending transactions read (D14; host's worker)
+read_touches = true            # diffs carry what each block read, with its values (PLAN D13/D16)
+pending_reads = false          # opt-in: and what the pool's best transactions read on the head (D14)
 early_publish = true           # publish each block once validated, before it is canonical (D15)
 ```
 
-`early_publish` and the read touches need the host's hooks (yevm-node has
-them). A `read_fill_budget_ms` line from before D15 must go: unknown
-fields stop the node.
+`early_publish` and the read touches need the host's hooks (`silt-exex`
+has them). `pending_reads` runs pool transactions on every new head, on a
+low-priority thread (nice 10, idle I/O): extra CPU and disk reads on the
+node, so it's off unless set. A `read_fill_budget_ms` line from before D15
+must go, because unknown fields stop the node.
 
 **Binding (D1).** Neither listener authenticates or encrypts.
 - Keep `lookup_bind` on loopback. It serves arbitrary state and proof reads,
@@ -77,11 +82,20 @@ binary cannot link two reths. silt pins one reth rev in the workspace
 on silt-node pins the same rev.
 
 ```sh
-CARGO_BUILD_JOBS=4 cargo build --release -p silt-exex          # stock reth + silt
+CARGO_BUILD_JOBS=4 cargo build --release -p silt-exex          # stock reth + silt, as reth's release build
+cargo build --profile maxperf -p silt-exex                     # as reth's fastest build (fat LTO); target/maxperf/
 # or, in the host repo: cargo build --release -p <host> --bin <node>
 target/release/silt-exex --version                             # reth version + commit
 strings target/release/silt-exex | grep -c "silt feed listening"   # 1: silt is in
 ```
+
+The profiles and default features are reth v2.11.0's (D16), so a
+`silt-exex` build compares one to one with a stock `reth` built the same
+way. The build needs what stock reth's needs: a C toolchain, `clang`
+(bindgen), `m4` (gmp), `make`. `maxperf` takes far longer to link and
+more memory than `--release`. For the fastest binary on the machine it
+runs on, add `RUSTFLAGS="-C target-cpu=native"`; reth's own releases
+don't, and the binary then runs only on CPUs like the build host's.
 
 A release build of reth needs several GB per job. **Next to a live node**,
 cap it: `CARGO_BUILD_JOBS=4`, one build at a time, ideally inside a

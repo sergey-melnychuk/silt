@@ -3,23 +3,24 @@
 //! hold what the chain is reading before a simulation asks.
 //!
 //! The host's executor reports them through a [`ReadTouches`] hook
-//! ([`ReadTouchSink`] is a ready-made bounded one), keyed by (number, parent
-//! hash, digest of the block's transactions), *with* their values (D15):
-//! after the block, the executor's cache holds its post-state, which for a
-//! key the block didn't write is also the value before it. Nothing is read
-//! back from the node's state.
+//! ([`ReadTouchSink`] is a ready-made bounded one), keyed by the block's
+//! (number, hash), *with* their values (D15): every value a block loads
+//! from the state below its own writes is the parent's, which for a key
+//! the block didn't write is also its own. Nothing is read back from the
+//! node's state. On reth's stock executor, [`crate::evm::SiltEvmConfig`]
+//! does the reporting (D16).
 //!
 //! Only the engine's own execution of a block may supply values: an RPC
 //! simulation of the same transactions on the same parent, with state
 //! overrides, must not. The sink enforces it with a per-thread ticket
 //! ([`ReadTouchSink::expect`] leaves it where the engine announces the
-//! payload; the executor it creates next on that thread claims it with
-//! [`ReadTouchSink::claim_ticket`]; [`ReadTouchSink::put`] accepts values
-//! only for the block the ticket names). RPC executions never hold one.
+//! payload; the EVM it creates next on that thread claims it with
+//! [`ReadTouchSink::claim_ticket`]; [`ReadTouchSink::put`] files values
+//! under the claimed ticket only). RPC executions never hold one.
 //!
-//! Pending read touches (PLAN D14): the host may also report what its
-//! pool's pending transactions read on the current head
-//! ([`ReadTouchSink::add_pending`]). The diff of the next block takes those
+//! Pending read touches (PLAN D14, opt-in): what the pool's pending
+//! transactions read on the current head ([`ReadTouchSink::add_pending`],
+//! from [`crate::pending`]'s worker). The diff of the next block takes those
 //! read on its parent ([`ReadTouches::take_pending`]) and publishes the ones
 //! it didn't write: unchanged, so their values hold at its block too. These
 //! values come from the node's own state, never from a caller.
@@ -50,12 +51,17 @@ impl ReadValues {
 
 /// Where the ExEx gets read touches from (see the module docs).
 pub trait ReadTouches: Send + Sync + 'static {
-    /// What the block `number`, built on `parent_hash` with transactions
-    /// `txs` ([`tx_digest`]), read, valued at that block (written keys
-    /// included; the diff drops those). Each block's are handed out once.
-    fn take(&self, number: u64, parent_hash: &Word, txs: &Word) -> Option<ReadValues>;
+    /// What block `number` with hash `hash` read, valued at that block
+    /// (written keys included; the diff drops those). Each block's are
+    /// handed out once.
+    fn take(&self, number: u64, hash: &Word) -> Option<ReadValues>;
 
-    /// Pending read touches (D14) for the diff of block `number` on
+    /// D14: one pass of the pool worker on head `(number, hash)`: `txs`
+    /// pool transactions run in `pass_us`, reading `values` there. The
+    /// default keeps nothing.
+    fn add_pending(&self, _head: (u64, Word), _values: ReadValues, _txs: u64, _pass_us: u64) {}
+
+    /// D14: pending read touches for the diff of block `number` on
     /// `parent_hash`: what pool transactions read on that parent, with its
     /// values there, less what was published within the last
     /// [`PENDING_RESEND_BLOCKS`]. Anything read on another head is dropped.
@@ -69,18 +75,6 @@ pub trait ReadTouches: Send + Sync + 'static {
     fn stats(&self) -> Option<String> {
         None
     }
-}
-
-/// Identifies a block's transaction list: keccak of its transaction hashes
-/// in order. The engine path and the executor compute it independently, so
-/// only an execution of exactly the block's transactions on its parent can
-/// report its keys.
-pub fn tx_digest<'a>(hashes: impl IntoIterator<Item = &'a Word>) -> Word {
-    let mut hasher = alloy_primitives::Keccak256::new();
-    for h in hashes {
-        hasher.update(h);
-    }
-    hasher.finalize().0
 }
 
 /// Most keys (accounts + slots) taken from one block; a block that reads
@@ -98,18 +92,17 @@ pub const MAX_PENDING_KEYS: usize = 20_000;
 /// pool keeps reading it.
 pub const PENDING_RESEND_BLOCKS: u64 = 64;
 
-/// A block the engine announced: (number, parent hash, transactions
-/// digest). See the module docs.
+/// A block the engine announced: its number and hash (the payload's, which
+/// the engine checks against the block it executes). See the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ticket {
     pub number: u64,
-    pub parent_hash: Word,
-    pub txs: Word,
+    pub hash: Word,
 }
 
 thread_local! {
     /// The ticket [`ReadTouchSink::expect`] left on this thread, until the
-    /// next executor created here claims it.
+    /// next EVM created here claims it.
     static TICKET: Cell<Option<Ticket>> = const { Cell::new(None) };
 }
 
@@ -128,7 +121,32 @@ struct Pending {
 #[derive(Debug)]
 struct Expected {
     ticket: Ticket,
-    values: Option<ReadValues>,
+    values: Option<Filed>,
+}
+
+/// A block's values as filed: ready, or in the executor's own form, to be
+/// converted when the ExEx takes them (off the engine's thread).
+enum Filed {
+    Ready(ReadValues),
+    Deferred(Box<dyn FnOnce() -> ReadValues + Send>),
+}
+
+impl Filed {
+    fn into_values(self) -> ReadValues {
+        match self {
+            Self::Ready(values) => values,
+            Self::Deferred(convert) => convert(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Filed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready(values) => write!(f, "Ready({} keys)", values.len()),
+            Self::Deferred(_) => f.write_str("Deferred"),
+        }
+    }
 }
 
 /// Counters for [`ReadTouches::stats`].
@@ -137,17 +155,17 @@ struct Counters {
     blocks: u64,
     keys: u64,
     dropped_keys: u64,
-    /// Executions without the engine's ticket for the block they ran (RPC
-    /// simulations, pending blocks, blocks synced from the network):
-    /// ignored.
-    unannounced: u64,
+    /// Values for a block no longer expected (aged out): ignored.
+    aged_out: u64,
+    /// Tickets an EVM for another block claimed (never expected): ignored.
+    mismatched: u64,
     /// Further executions of an announced block already filled: ignored.
     refilled: u64,
     collect_us_sum: u64,
     collect_us_max: u64,
-    /// D14: pool transactions the host executed, the passes it took, the
-    /// time they took, keys collected and dropped at the cap, keys skipped
-    /// as recently published, and keys handed to a diff.
+    /// D14: pool transactions run, the passes they took, the time they
+    /// took, keys collected and dropped at the cap, keys skipped as
+    /// recently published, and keys handed to a diff.
     pending_txs: u64,
     pending_passes: u64,
     pending_us_sum: u64,
@@ -161,9 +179,9 @@ struct Counters {
     pending_stale: u64,
 }
 
-/// A bounded sink between the engine ([`ReadTouchSink::expect`]), the
-/// executor ([`ReadTouchSink::claim_ticket`], [`ReadTouchSink::put`]) and
-/// the ExEx ([`ReadTouches::take`]).
+/// A bounded sink between the engine ([`ReadTouchSink::expect`]), its EVMs
+/// ([`ReadTouchSink::claim_ticket`], [`ReadTouchSink::put`]) and the ExEx
+/// ([`ReadTouches::take`]).
 ///
 /// Only the engine's own executions are kept (the module docs): the node's
 /// RPC can run the same executor (`eth_simulateV1`) on the same parent,
@@ -187,16 +205,12 @@ impl ReadTouchSink {
         }
     }
 
-    /// The engine is about to execute block `number` on `parent_hash` with
-    /// transactions `txs` ([`tx_digest`]). Call it where the engine
-    /// announces the payload (reth: `context_for_payload`): it also leaves
-    /// this thread's ticket for the executor created next.
-    pub fn expect(&self, number: u64, parent_hash: Word, txs: Word) {
-        let ticket = Ticket {
-            number,
-            parent_hash,
-            txs,
-        };
+    /// The engine is about to execute block `number` with hash `hash`. Call
+    /// it where the engine announces the payload (reth:
+    /// `context_for_payload`): it also leaves this thread's ticket for the
+    /// EVM created next.
+    pub fn expect(&self, number: u64, hash: Word) {
+        let ticket = Ticket { number, hash };
         TICKET.set(Some(ticket));
         let mut blocks = self.blocks.lock().expect("read sink lock");
         if blocks.iter().any(|e| e.ticket == ticket) {
@@ -212,35 +226,52 @@ impl ReadTouchSink {
     }
 
     /// Takes this thread's ticket, if [`Self::expect`] left one. Call it
-    /// where an executor is created, and hand the ticket to
-    /// [`Self::put`]; every executor claims, so a ticket never outlives the
-    /// executor it was left for.
+    /// where an EVM is created; every EVM created on the thread claims, so a
+    /// ticket never outlives the one it was left for.
     pub fn claim_ticket() -> Option<Ticket> {
         TICKET.take()
     }
 
-    /// An execution finished: it ran `executed` (number, parent hash and
-    /// the digest of the transactions it actually executed) and read
-    /// `values` at its end, collected in `collect_us`. Kept only when
-    /// `claimed` (its executor's ticket) names exactly that block, the
-    /// block is still expected and not yet filled; at most
-    /// [`MAX_KEYS_PER_BLOCK`] keys.
-    pub fn put(
+    /// Drops this thread's ticket: the engine is about to execute a block it
+    /// didn't announce as a payload (reth: `context_for_block`).
+    pub fn clear_ticket() {
+        TICKET.set(None);
+    }
+
+    /// A ticket was claimed by an EVM that doesn't run its block: counted,
+    /// nothing kept.
+    pub fn mismatched(&self) {
+        self.counters
+            .lock()
+            .expect("read sink counters lock")
+            .mismatched += 1;
+    }
+
+    /// The execution holding `ticket` finished and read `values`, collected
+    /// in `collect_us`. Kept if the block is still expected and not yet
+    /// filled; at most [`MAX_KEYS_PER_BLOCK`] keys are handed out.
+    pub fn put(&self, ticket: Ticket, values: ReadValues, collect_us: u64) {
+        self.file(ticket, Filed::Ready(values), collect_us);
+    }
+
+    /// [`Self::put`], with the conversion to [`ReadValues`] left to the
+    /// ExEx's [`ReadTouches::take`]: the engine's thread only moves what it
+    /// recorded (`file_us` is that time).
+    pub fn put_deferred(
         &self,
-        claimed: Option<Ticket>,
-        executed: Ticket,
-        mut values: ReadValues,
-        collect_us: u64,
+        ticket: Ticket,
+        convert: impl FnOnce() -> ReadValues + Send + 'static,
+        file_us: u64,
     ) {
+        self.file(ticket, Filed::Deferred(Box::new(convert)), file_us);
+    }
+
+    fn file(&self, ticket: Ticket, values: Filed, collect_us: u64) {
         let mut counters = self.counters.lock().expect("read sink counters lock");
-        if claimed != Some(executed) {
-            counters.unannounced += 1;
-            return;
-        }
         let mut blocks = self.blocks.lock().expect("read sink lock");
-        let slot = match blocks.iter_mut().find(|e| e.ticket == executed) {
+        let slot = match blocks.iter_mut().find(|e| e.ticket == ticket) {
             None => {
-                counters.unannounced += 1;
+                counters.aged_out += 1;
                 return;
             }
             Some(slot) if slot.values.is_some() => {
@@ -249,7 +280,28 @@ impl ReadTouchSink {
             }
             Some(slot) => slot,
         };
+        counters.blocks += 1;
+        counters.collect_us_sum += collect_us;
+        counters.collect_us_max = counters.collect_us_max.max(collect_us);
+        slot.values = Some(values);
+    }
+}
+
+impl ReadTouches for ReadTouchSink {
+    fn take(&self, number: u64, hash: &Word) -> Option<ReadValues> {
+        let ticket = Ticket {
+            number,
+            hash: *hash,
+        };
+        let mut blocks = self.blocks.lock().expect("read sink lock");
+        let at = blocks
+            .iter()
+            .position(|e| e.ticket == ticket && e.values.is_some())?;
+        let filed = blocks.remove(at).and_then(|e| e.values)?;
+        drop(blocks);
+        let mut values = filed.into_values();
         let total = values.len();
+        let mut counters = self.counters.lock().expect("read sink counters lock");
         if total > MAX_KEYS_PER_BLOCK {
             values.accounts.truncate(MAX_KEYS_PER_BLOCK);
             values
@@ -257,19 +309,14 @@ impl ReadTouchSink {
                 .truncate(MAX_KEYS_PER_BLOCK - values.accounts.len());
             counters.dropped_keys += (total - MAX_KEYS_PER_BLOCK) as u64;
         }
-        counters.blocks += 1;
         counters.keys += values.len() as u64;
-        counters.collect_us_sum += collect_us;
-        counters.collect_us_max = counters.collect_us_max.max(collect_us);
-        slot.values = Some(values);
+        Some(values)
     }
 
-    /// D14: one pass of the host's pool worker on head `(number, hash)`:
-    /// `txs` pool transactions executed in `pass_us`, reading `values` (at
-    /// that head). Held, deduplicated, until the next diff takes them; at
-    /// most [`MAX_PENDING_KEYS`]. A pass on a newer head replaces what an
-    /// older one left; a pass on an older head is dropped.
-    pub fn add_pending(&self, head: (u64, Word), values: ReadValues, txs: u64, pass_us: u64) {
+    /// A pass on a newer head replaces what an older one left; a pass on an
+    /// older head is dropped. Held deduplicated, at most
+    /// [`MAX_PENDING_KEYS`].
+    fn add_pending(&self, head: (u64, Word), values: ReadValues, txs: u64, pass_us: u64) {
         let mut pending = self.pending.lock().expect("read sink pending lock");
         let (mut added, mut dropped, mut stale) = (0u64, 0u64, 0u64);
         match pending.head {
@@ -307,21 +354,6 @@ impl ReadTouchSink {
         c.pending_keys += added;
         c.pending_dropped += dropped;
         c.pending_stale += stale;
-    }
-}
-
-impl ReadTouches for ReadTouchSink {
-    fn take(&self, number: u64, parent_hash: &Word, txs: &Word) -> Option<ReadValues> {
-        let ticket = Ticket {
-            number,
-            parent_hash: *parent_hash,
-            txs: *txs,
-        };
-        let mut blocks = self.blocks.lock().expect("read sink lock");
-        let at = blocks
-            .iter()
-            .position(|e| e.ticket == ticket && e.values.is_some())?;
-        blocks.remove(at).and_then(|e| e.values)
     }
 
     fn take_pending(&self, number: u64, parent_hash: &Word) -> ReadValues {
@@ -376,26 +408,32 @@ impl ReadTouches for ReadTouchSink {
 
     fn stats(&self) -> Option<String> {
         let c = std::mem::take(&mut *self.counters.lock().expect("read sink counters lock"));
-        Some(format!(
-            "blocks {} keys/block {} collect µs avg {} max {} dropped keys {} unannounced executions {} refilled {} | \
-             pending: passes {} txs {} pass ms avg {:.1} max {:.1} keys {} dropped {} stale {} skipped (recent) {} to diffs {}",
+        let mut line = format!(
+            "blocks filed {} keys/block taken {} file µs avg {} max {} dropped keys {} aged out {} mismatched {} refilled {}",
             c.blocks,
             c.keys / c.blocks.max(1),
             c.collect_us_sum / c.blocks.max(1),
             c.collect_us_max,
             c.dropped_keys,
-            c.unannounced,
+            c.aged_out,
+            c.mismatched,
             c.refilled,
-            c.pending_passes,
-            c.pending_txs,
-            c.pending_us_sum as f64 / 1e3 / c.pending_passes.max(1) as f64,
-            c.pending_us_max as f64 / 1e3,
-            c.pending_keys,
-            c.pending_dropped,
-            c.pending_stale,
-            c.pending_skipped,
-            c.pending_taken
-        ))
+        );
+        if c.pending_passes > 0 || c.pending_taken > 0 {
+            line += &format!(
+                " | pending: passes {} txs {} pass ms avg {:.1} max {:.1} keys {} dropped {} stale {} skipped (recent) {} to diffs {}",
+                c.pending_passes,
+                c.pending_txs,
+                c.pending_us_sum as f64 / 1e3 / c.pending_passes.max(1) as f64,
+                c.pending_us_max as f64 / 1e3,
+                c.pending_keys,
+                c.pending_dropped,
+                c.pending_stale,
+                c.pending_skipped,
+                c.pending_taken
+            );
+        }
+        Some(line)
     }
 }
 
@@ -431,26 +469,26 @@ impl Written {
 }
 
 /// Adds read touches to `diff`: those the span didn't write (nor slots of an
-/// account it destroyed) and the diff doesn't already carry. A block's own
-/// (D15) were read at that block, a pool pass's (D14) on the diff's parent;
-/// either way, unwritten, they hold at the diff's block. Sorted. Returns
-/// how many it added.
-pub fn merge_reads(diff: &mut BlockDiff, pending: ReadValues) -> usize {
+/// account it destroyed) and the diff doesn't already carry, each key once.
+/// A block's own (D15) were read at that block, a pool pass's (D14) on the
+/// diff's parent; either way, unwritten, they hold at the diff's block.
+/// Sorted. Returns how many it added.
+pub fn merge_reads(diff: &mut BlockDiff, values: ReadValues) -> usize {
     let written = Written::of(diff);
-    let held_accounts: BTreeSet<Addr> = diff.read_accounts.iter().map(|(a, _)| *a).collect();
-    let held_slots: BTreeSet<(Addr, Word)> =
+    let mut held_accounts: BTreeSet<Addr> = diff.read_accounts.iter().map(|(a, _)| *a).collect();
+    let mut held_slots: BTreeSet<(Addr, Word)> =
         diff.read_storage.iter().map(|(a, s, _)| (*a, *s)).collect();
     let before = diff.read_accounts.len() + diff.read_storage.len();
     diff.read_accounts.extend(
-        pending
+        values
             .accounts
             .into_iter()
-            .filter(|(a, _)| !written.account(a) && !held_accounts.contains(a)),
+            .filter(|(a, _)| !written.account(a) && held_accounts.insert(*a)),
     );
     diff.read_storage
-        .extend(pending.slots.into_iter().filter(|(a, s, _)| {
+        .extend(values.slots.into_iter().filter(|(a, s, _)| {
             let key = (*a, *s);
-            !written.slot(&key) && !held_slots.contains(&key)
+            !written.slot(&key) && held_slots.insert(key)
         }));
     diff.read_accounts.sort_unstable_by_key(|(a, _)| *a);
     diff.read_storage.sort_unstable_by_key(|(a, s, _)| (*a, *s));
@@ -480,77 +518,70 @@ mod tests {
         }
     }
 
-    fn sorted(mut v: ReadValues) -> ReadValues {
-        v.accounts.sort_unstable_by_key(|(a, _)| *a);
-        v.slots.sort_unstable_by_key(|(a, s, _)| (*a, *s));
-        v
-    }
-
-    fn ticket(number: u64, parent: u8, txs: Word) -> Ticket {
+    fn ticket(number: u64, hash: u8) -> Ticket {
         Ticket {
             number,
-            parent_hash: [parent; 32],
-            txs,
+            hash: [hash; 32],
         }
     }
 
-    /// D15: values are kept only from an executor holding the engine's
-    /// ticket for exactly the block it ran, once per block; the sink stays
-    /// bounded.
+    /// Values are filed only under a ticket the engine announced, once per
+    /// block; the sink stays bounded.
     #[test]
-    fn sink_keeps_only_ticketed_executions_once_and_stays_bounded() {
+    fn sink_keeps_announced_blocks_once_and_stays_bounded() {
         let sink = ReadTouchSink::new(2);
-        let txs = tx_digest(&[[0xAB; 32]]);
-        let t10 = ticket(10, 1, txs);
-        // An execution nobody announced (an RPC simulation) is ignored.
-        sink.put(None, t10, values(&[9], &[]), 5);
-        assert_eq!(sink.take(10, &[1; 32], &txs), None);
+        // Values for a block nobody announced: ignored.
+        sink.put(ticket(10, 0xA), values(&[9], &[]), 5);
+        assert_eq!(sink.take(10, &[0xA; 32]), None);
 
-        sink.expect(10, [1; 32], txs);
+        sink.expect(10, [0xA; 32]);
         let claimed = ReadTouchSink::claim_ticket();
-        assert_eq!(claimed, Some(t10));
+        assert_eq!(claimed, Some(ticket(10, 0xA)));
         assert_eq!(ReadTouchSink::claim_ticket(), None, "claimed once");
-        assert_eq!(sink.take(10, &[1; 32], &txs), None, "nothing put yet");
-        // The same block without the ticket (an RPC simulation of the same
-        // transactions on the same parent, overrides and all): ignored.
-        sink.put(None, t10, values(&[8], &[]), 7);
-        // The ticketed executor ran other transactions: ignored.
-        sink.put(claimed, ticket(10, 1, tx_digest(&[])), values(&[7], &[]), 7);
-        sink.put(claimed, t10, values(&[1], &[(2, 2, 2)]), 7);
+        assert_eq!(sink.take(10, &[0xA; 32]), None, "nothing put yet");
+        sink.put(ticket(10, 0xA), values(&[1], &[(2, 2, 2)]), 7);
         // A second engine execution of the same block doesn't replace them.
-        sink.put(claimed, t10, values(&[6], &[]), 7);
-        // Same block number and parent, other transactions: not this block.
-        assert_eq!(sink.take(10, &[1; 32], &tx_digest(&[])), None);
-        assert_eq!(
-            sink.take(10, &[1; 32], &txs),
-            Some(values(&[1], &[(2, 2, 2)]))
-        );
-        assert_eq!(sink.take(10, &[1; 32], &txs), None, "taken once");
+        sink.put(ticket(10, 0xA), values(&[6], &[]), 7);
+        // Same number, another block (a sibling): not this block.
+        assert_eq!(sink.take(10, &[0xB; 32]), None);
+        assert_eq!(sink.take(10, &[0xA; 32]), Some(values(&[1], &[(2, 2, 2)])));
+        assert_eq!(sink.take(10, &[0xA; 32]), None, "taken once");
 
-        for (n, p) in [(11, 2), (12, 3), (13, 4)] {
-            sink.expect(n, [p; 32], txs);
-            let claimed = ReadTouchSink::claim_ticket();
-            sink.put(claimed, ticket(n, p, txs), values(&[p], &[]), 1);
+        for n in [11, 12, 13] {
+            sink.expect(n, [n as u8; 32]);
+            let claimed = ReadTouchSink::claim_ticket().unwrap();
+            sink.put(claimed, values(&[n as u8], &[]), 1);
         }
-        assert_eq!(sink.take(11, &[2; 32], &txs), None, "aged out past cap");
-        assert_eq!(sink.take(13, &[4; 32], &txs), Some(values(&[4], &[])));
+        assert_eq!(sink.take(11, &[11; 32]), None, "aged out past cap");
+        assert_eq!(sink.take(13, &[13; 32]), Some(values(&[13], &[])));
+        sink.mismatched();
         let stats = sink.stats().unwrap();
         assert!(
-            stats.contains("unannounced executions 3 refilled 1"),
+            stats.contains("aged out 1 mismatched 1 refilled 1"),
             "{stats}"
         );
     }
 
-    /// The ticket stays on the thread that announced the payload.
+    /// The ticket stays on the thread that announced the payload, and a
+    /// block the engine didn't announce clears it.
     #[test]
-    fn ticket_is_per_thread() {
+    fn ticket_is_per_thread_and_cleared() {
         let sink = ReadTouchSink::new(2);
-        sink.expect(5, [5; 32], [0; 32]);
+        sink.expect(5, [5; 32]);
         let elsewhere = std::thread::spawn(ReadTouchSink::claim_ticket)
             .join()
             .unwrap();
         assert_eq!(elsewhere, None);
-        assert_eq!(ReadTouchSink::claim_ticket(), Some(ticket(5, 5, [0; 32])));
+        assert_eq!(ReadTouchSink::claim_ticket(), Some(ticket(5, 5)));
+        sink.expect(6, [6; 32]);
+        ReadTouchSink::clear_ticket();
+        assert_eq!(ReadTouchSink::claim_ticket(), None);
+    }
+
+    fn sorted(mut v: ReadValues) -> ReadValues {
+        v.accounts.sort_unstable_by_key(|(a, _)| *a);
+        v.slots.sort_unstable_by_key(|(a, s, _)| (*a, *s));
+        v
     }
 
     /// D14: pending touches go to the diff built on the head they were read
@@ -586,10 +617,10 @@ mod tests {
         assert!(stats.contains("skipped (recent) 1"), "{stats}");
     }
 
-    /// Read touches the diff wrote, slots of accounts it destroyed and keys
-    /// it already carries stay out.
+    /// Read touches the diff wrote, slots of accounts it destroyed, keys it
+    /// already carries and repeats stay out.
     #[test]
-    fn merge_reads_skips_written_and_held_keys() {
+    fn merge_reads_skips_written_held_and_repeated_keys() {
         let mut diff = BlockDiff {
             span_start: 5,
             number: 5,
@@ -605,7 +636,10 @@ mod tests {
         };
         let added = merge_reads(
             &mut diff,
-            values(&[1, 4, 6], &[(2, 1, 1), (3, 3, 9), (3, 4, 9), (7, 7, 7)]),
+            values(
+                &[1, 4, 6, 6],
+                &[(2, 1, 1), (3, 3, 9), (3, 4, 9), (7, 7, 7), (3, 4, 9)],
+            ),
         );
         assert_eq!(added, 3);
         assert_eq!(
@@ -621,15 +655,14 @@ mod tests {
     #[test]
     fn sink_caps_keys_per_block() {
         let sink = ReadTouchSink::new(4);
-        let txs = tx_digest(&[]);
-        sink.expect(1, [0; 32], txs);
-        let claimed = ReadTouchSink::claim_ticket();
+        sink.expect(1, [1; 32]);
+        let claimed = ReadTouchSink::claim_ticket().unwrap();
         let many = ReadValues {
             accounts: vec![([1; 20], change(1)); MAX_KEYS_PER_BLOCK],
             slots: vec![([1; 20], [2; 32], [3; 32]); 10],
         };
-        sink.put(claimed, ticket(1, 0, txs), many, 1);
-        let got = sink.take(1, &[0; 32], &txs).unwrap();
+        sink.put(claimed, many, 1);
+        let got = sink.take(1, &[1; 32]).unwrap();
         assert_eq!(got.len(), MAX_KEYS_PER_BLOCK);
         assert!(sink.stats().unwrap().contains("dropped keys 10"));
     }

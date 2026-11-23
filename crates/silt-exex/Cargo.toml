@@ -4,11 +4,40 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# Thin host binary (PLAN D7): stock reth (EthereumNode, stock CLI) with
-# silt-node installed. All silt logic lives in silt-node; the reth pin is
-# the workspace's (root Cargo.toml).
+# Thin host binary (PLAN D7, D16): stock reth (EthereumNode, stock CLI, stock
+# evm2 executor) with silt-node installed. All silt logic lives in
+# silt-node; the reth pin is the workspace's (root Cargo.toml).
 [dependencies]
 silt-node.workspace = true
 eyre.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 reth-ethereum = { workspace = true, features = ["full", "cli"] }
+alloy-primitives = "1"
+
+# Stock reth's default features (bin/reth/Cargo.toml at the pinned rev), as
+# far as reth-ethereum forwards them, so `--release` / `--profile maxperf`
+# build the same node as reth's. Left out: `jit` (evm2's JIT: off at
+# runtime unless `--jit`; it needs reth's `evm2-jit` patch and LLVM),
+# `otlp-logs` and `min-trace-logs` (not forwarded; the latter changes
+# nothing by default).
+[features]
+default = [
+    "jemalloc",
+    "otlp",
+    "js-tracer",
+    "keccak-cache-global",
+    "asm-keccak",
+    "gmp",
+    "portable",
+]
+jemalloc = ["reth-ethereum/jemalloc"]
+otlp = ["reth-ethereum/otlp"]
+js-tracer = ["reth-ethereum/js-tracer"]
+keccak-cache-global = [
+    "reth-ethereum/keccak-cache-global",
+    "alloy-primitives/keccak-cache-global",
+]
+asm-keccak = ["reth-ethereum/asm-keccak", "alloy-primitives/asm-keccak"]
+gmp = ["reth-ethereum/gmp"]
+portable = ["reth-ethereum/portable"]

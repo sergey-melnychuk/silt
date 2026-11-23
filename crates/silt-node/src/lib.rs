@@ -11,21 +11,33 @@
 //! - **`silt_multiproof`** — path-directed multiproofs on reth's own RPC
 //!   transports ([`rpc`], D8).
 //!
-//! Installing it in a node is two builder calls; this is all of
-//! `silt-exex`'s `main` (stock executor), and a custom node (e.g. one with
-//! its own executor) adds the same two calls to its own builder chain:
+//! Installing it in a node is two builder calls, plus, for read touches
+//! (D13/D16) and early publishing (D15), the stock EVM config wrapped by
+//! [`evm::SiltExecutorBuilder`] and the engine's events forwarded after
+//! launch. `silt-exex`'s `main` is the whole of it; a node with its own
+//! executor reports read touches from that executor instead
+//! ([`reads::ReadTouchSink`]):
 //!
 //! ```ignore
 //! let cfg = silt_node::SiltConfig::load()?; // ./silt.toml, defaults otherwise
+//! let reads = cfg.read_touches.then(|| Arc::new(ReadTouchSink::new(256)));
+//! let exex_reads = reads.clone().map(|r| r as Arc<dyn ReadTouches>);
+//! let (early_tx, early_rx) = silt_node::early::channel();
 //! let handle = builder
-//!     .node(EthereumNode::default())
-//!     .install_exex("silt", async move |ctx| Ok(silt_node::run_exex(ctx, cfg)))
+//!     .with_types::<EthereumNode>()
+//!     .with_components(EthereumNode::components().executor(SiltExecutorBuilder::new(reads)))
+//!     .with_add_ons(EthereumAddOns::default())
+//!     .install_exex("silt", async move |ctx| {
+//!         Ok(silt_node::run_exex_with(ctx, cfg, exex_reads, Some(early_rx)))
+//!     })
 //!     .extend_rpc_modules(|ctx| {
 //!         ctx.modules.merge_configured(silt_node::rpc_module(ctx.provider().clone()))?;
 //!         Ok(())
 //!     })
 //!     .launch_with_debug_capabilities()
 //!     .await?;
+//! let events = handle.node.add_ons_handle.engine_events.new_listener();
+//! tokio::spawn(silt_node::early::forward_engine_events(events, early_tx));
 //! ```
 //!
 //! The host must build against the same reth as silt-node (the workspace
@@ -33,9 +45,11 @@
 
 pub mod config;
 pub mod early;
+pub mod evm;
 pub mod feed;
 pub mod lookup;
 pub mod mapping;
+pub mod pending;
 pub mod reads;
 pub mod rpc;
 
@@ -43,7 +57,8 @@ pub use config::SiltConfig;
 pub use rpc::{SiltApiServer, SiltRpc};
 
 use futures::TryStreamExt;
-use reth_ethereum::EthPrimitives;
+use reth_ethereum::pool::{PoolTransaction, TransactionPool};
+use reth_ethereum::{EthPrimitives, TransactionSigned};
 use reth_ethereum::chainspec::{ChainSpec, EthChainSpec};
 use reth_ethereum::exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_ethereum::node::api::{FullNodeComponents, NodeTypes};
@@ -68,13 +83,15 @@ where
 pub async fn run_exex<Node>(ctx: ExExContext<Node>, cfg: SiltConfig) -> eyre::Result<()>
 where
     Node: FullNodeComponents<Types: NodeTypes<Primitives = EthPrimitives, ChainSpec = ChainSpec>>,
+    Node::Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
 {
     run_exex_with(ctx, cfg, None, None).await
 }
 
 /// [`run_exex`] with the host's optional hooks:
-/// - `reads`: diffs also carry read touches (PLAN D13/D14/D15), the values
-///   the host's executor and pool worker report;
+/// - `reads`: diffs also carry read touches (PLAN D13/D15/D16), the values
+///   the host's executor reports; with `cfg.pending_reads`, also what the
+///   pool's pending transactions read on the head (D14, [`pending`]);
 /// - `early`: the engine's executed blocks, from
 ///   [`early::forward_engine_events`]. With `cfg.early_publish`, each block
 ///   is published as soon as the engine has executed and validated it
@@ -88,6 +105,7 @@ pub async fn run_exex_with<Node>(
 ) -> eyre::Result<()>
 where
     Node: FullNodeComponents<Types: NodeTypes<Primitives = EthPrimitives, ChainSpec = ChainSpec>>,
+    Node::Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
 {
     let chain_id = ctx.config.chain.chain().id();
     let genesis_hash = ctx.config.chain.genesis_hash().0;
@@ -131,6 +149,30 @@ where
         });
     }
 
+    // D14: the pool worker, fed each canonical head below.
+    let pending = match (&reads, cfg.pending_reads) {
+        (Some(sink), true) => match pending::spawn(
+            ctx.provider().clone(),
+            ctx.pool().clone(),
+            ctx.evm_config().clone(),
+            sink.clone(),
+        ) {
+            Ok(heads) => {
+                tracing::info!("silt: pending read touches on (pool worker started)");
+                Some(heads)
+            }
+            Err(err) => {
+                tracing::warn!(%err, "silt: pool worker not started; no pending read touches");
+                None
+            }
+        },
+        (None, true) => {
+            tracing::warn!("silt: pending_reads needs read_touches; off");
+            None
+        }
+        _ => None,
+    };
+
     let mut early = early.filter(|_| cfg.early_publish);
     tracing::info!(early = early.is_some(), "silt: publishing blocks");
     // The chain published so far: early blocks continue it; committed
@@ -158,8 +200,17 @@ where
             }
             notification = ctx.notifications.try_next() => {
                 let Some(notification) = notification? else { break };
+                // D14: the new canonical head, for the pool worker.
+                let tip = pending
+                    .as_ref()
+                    .and_then(|_| notification.committed_chain())
+                    .map(|chain| chain.tip().clone_sealed_header());
                 on_notification(&ctx, &cfg, &publisher, &mut published, reads.as_deref(), &mut stats, notification)
                     .await?;
+                if let (Some(heads), Some(tip)) = (&pending, tip) {
+                    // The worker may be gone (it logs why): nothing to do then.
+                    let _ = heads.send(tip);
+                }
             }
         }
     }
@@ -203,7 +254,7 @@ async fn publish_early(
         }
     };
     if let Some(reads) = reads {
-        add_reads(reads, &mut diff, [(number, parent, tx_digest(block))]);
+        add_reads(reads, &mut diff, [(number, hash)]);
     }
     log_publish(&diff, "early");
     publisher.publish_diff(&diff).await?;
@@ -287,7 +338,7 @@ where
                 let blocks = chain
                     .blocks_iter()
                     .filter(|b| (diff.span_start..=diff.number).contains(&b.number()))
-                    .map(|b| (b.number(), b.parent_hash().0, tx_digest(b)))
+                    .map(|b| (b.number(), b.hash().0))
                     .collect::<Vec<_>>();
                 add_reads(reads, &mut diff, blocks);
             }
@@ -306,18 +357,6 @@ where
     Ok(())
 }
 
-fn tx_digest(
-    block: &reth_ethereum::primitives::RecoveredBlock<reth_ethereum::Block>,
-) -> silt_wire::Word {
-    let hashes: Vec<silt_wire::Word> = block
-        .body()
-        .transactions
-        .iter()
-        .map(|tx| tx.tx_hash().0)
-        .collect();
-    reads::tx_digest(&hashes)
-}
-
 fn log_publish(diff: &silt_wire::BlockDiff, path: &'static str) {
     tracing::info!(
         span = ?(diff.span_start..=diff.number),
@@ -330,17 +369,17 @@ fn log_publish(diff: &silt_wire::BlockDiff, path: &'static str) {
     );
 }
 
-/// D13/D15 and D14: the read touches the host's executor reported for the
-/// span's `blocks` (number, parent hash, transactions digest), valued at
-/// each block; then the pool's pending touches read on the diff's parent.
-/// Both skip what the span wrote. No reads from the node's state.
+/// D13/D15: the read touches the host's executor reported for the span's
+/// `blocks` (number, hash), valued at each block; then (D14) the pool's
+/// pending touches read on the diff's parent. Both skip what the span
+/// wrote. No reads from the node's state.
 fn add_reads(
     reads: &dyn reads::ReadTouches,
     diff: &mut silt_wire::BlockDiff,
-    blocks: impl IntoIterator<Item = (u64, silt_wire::Word, silt_wire::Word)>,
+    blocks: impl IntoIterator<Item = (u64, silt_wire::Word)>,
 ) {
-    for (number, parent_hash, txs) in blocks {
-        if let Some(values) = reads.take(number, &parent_hash, &txs) {
+    for (number, hash) in blocks {
+        if let Some(values) = reads.take(number, &hash) {
             reads::merge_reads(diff, values);
         }
     }

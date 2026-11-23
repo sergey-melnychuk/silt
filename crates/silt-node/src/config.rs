@@ -29,13 +29,15 @@ pub struct SiltConfig {
     /// at most this many blocks, each with only its own keys. 0 = no cap
     /// (one diff per segment, D6).
     pub max_span: u64,
-    /// Publish read touches (D13) when the host reports them: the keys each
-    /// block read, valued at the block, so consumer caches hold the chain's
-    /// hot set. `false` = diffs carry none (the host's sink isn't wired).
+    /// Publish read touches (D13): the keys each block read, valued at the
+    /// block, so consumer caches hold the chain's hot set. silt-exex
+    /// records them on reth's stock executor (D16). `false` = diffs carry
+    /// none and the engine's EVMs run unwrapped.
     pub read_touches: bool,
-    /// Pending read touches (D14): the host runs pool transactions on the
-    /// head and the next diff carries what they read. Needs
-    /// `read_touches`; `false` = the host's pool worker doesn't start.
+    /// Pending read touches (D14): a low-priority worker runs the pool's
+    /// best transactions on each new canonical head with the node's own
+    /// EVM config, and the next diff carries what they read. Needs
+    /// `read_touches`. Off by default: it is extra execution on the node.
     pub pending_reads: bool,
     /// Publish each block as soon as the engine has executed and validated
     /// it (D15), when the host forwards the engine's events; the ExEx then
@@ -56,7 +58,7 @@ impl Default for SiltConfig {
             lookup_proof_max_depth: 8,
             max_span: 32,
             read_touches: true,
-            pending_reads: true,
+            pending_reads: false,
             early_publish: true,
         }
     }
@@ -94,7 +96,10 @@ mod tests {
         assert!(cfg.read_touches, "D13 on by default");
         let off: SiltConfig = toml::from_str("read_touches = false").unwrap();
         assert!(!off.read_touches);
-        assert!(cfg.pending_reads && cfg.early_publish);
+        assert!(cfg.early_publish);
+        assert!(!cfg.pending_reads, "D14 opt-in");
+        let on: SiltConfig = toml::from_str("pending_reads = true").unwrap();
+        assert!(on.pending_reads);
         let off: SiltConfig = toml::from_str("early_publish = false").unwrap();
         assert!(!off.early_publish);
         // D15 dropped the fill budget: a leftover line is an error, not ignored.

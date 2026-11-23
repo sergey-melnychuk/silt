@@ -14,7 +14,7 @@ is drop-to-cold (v0). See `PLAN.md` for the full design and milestones,
 |---|---|---|
 | `silt-wire` | wire types, postcard codec, framing, handshake; the binary lookup + proof layout (`lookup`) | no |
 | `silt-node` | library any reth node installs: the feed ExEx + TCP publisher, lookup + proof server, `silt_multiproof` RPC | pinned v2.11.0 (`b9abbcc`) |
-| `silt-exex` | thin binary: stock reth with silt-node installed | pinned v2.11.0 (`b9abbcc`) |
+| `silt-exex` | thin binary: stock reth (its evm2 executor, features and profiles) with silt-node installed | pinned v2.11.0 (`b9abbcc`) |
 | `silt-cache` | subscriber, cache, lookup client, RPC fallback, Chain-shaped API (+ optional `yevm` adapter) | no |
 
 ## Run
@@ -22,10 +22,12 @@ is drop-to-cold (v0). See `PLAN.md` for the full design and milestones,
 ```sh
 cargo build --release                       # wire + cache (reth-free)
 cargo build --release -p silt-exex          # the node wrapper (compiles reth)
+cargo build --profile maxperf -p silt-exex  # ... as reth's fastest build (fat LTO)
 
-# the wrapper IS reth — same CLI, same datadir; silt.toml (optional, in the
+# the wrapper IS reth — same CLI, same datadir, same evm2 executor; it and
+# stock reth can take turns on one datadir. silt.toml (optional, in the
 # working directory) sets bind/spool/heartbeat_secs/lookup_bind/lookup_workers/
-# lookup_proof_workers/lookup_proof_max_depth;
+# lookup_proof_workers/lookup_proof_max_depth/max_span/read_touches/pending_reads/early_publish;
 # defaults: feed on 127.0.0.1:8585, lookup fast path on 127.0.0.1:8586
 ./target/release/silt-exex node <your usual reth flags>
 
@@ -109,8 +111,7 @@ let (cache, mut heads) = silt_cache::Cache::connect(cfg);
 
 ## Installing silt in another reth node
 
-`silt-node` is a library; any reth node installs it with two builder calls
-(this is all of `silt-exex`'s `main`):
+`silt-node` is a library; any reth node installs it with two builder calls:
 
 ```rust
 let cfg = silt_node::SiltConfig::load()?; // ./silt.toml, defaults otherwise
@@ -127,10 +128,24 @@ let handle = builder
     .await?;
 ```
 
+That gives the feed (published once blocks are canonical), lookups and
+`silt_multiproof`. Two more steps give what `silt-exex` has (its `main` is
+the full example):
+
+- **Read touches (PLAN D13/D16):** on the stock executor, use
+  `silt_node::evm::SiltExecutorBuilder` as the components' executor (reth's
+  own EVM config, recording what each payload's block reads). A node with
+  its own executor reports through `silt_node::reads::ReadTouchSink`
+  instead. Either way, pass the sink to `run_exex_with`.
+- **Publishing at execution (D15):** pass `early::channel()`'s receiver to
+  `run_exex_with` and, after launch, forward
+  `handle.node.add_ons_handle.engine_events.new_listener()` with
+  `early::forward_engine_events`.
+
 The host must build against the same reth as silt (the workspace pin): one
-binary can't link two reth versions. silt pins yevm-node's reth rev
-(v2.11.0, `b9abbcc`) and its `[patch]` set, so yevm-node can depend on silt-node
-as-is. `run_exex` needs Ethereum primitives
+binary can't link two reth versions. silt pins reth v2.11.0 (`b9abbcc`)
+and mirrors its `[patch]` set; yevm-node pins the same, so it can depend on
+silt-node as-is. `run_exex` needs Ethereum primitives
 and `ChainSpec` (`NodeTypes<Primitives = EthPrimitives, ChainSpec =
 ChainSpec>`); the lookup server only needs the node's provider.
 

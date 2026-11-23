@@ -401,7 +401,8 @@ yevm's trait. The core crate has **no yevm dependency**.
     it are left out and counted, so a disk stall during a batch commit
     can't hold a diff back. One fill took 1.8 s before the budget existed.
 - **D14 — Diffs carry pending read touches (2026-11-19, PLAN M6; the
-  user's decision).** After D13 and the lookup view reuse, a miss costs
+  user's decision; opt-in since D16, on the node's own EVM config).**
+  After D13 and the lookup view reuse, a miss costs
   ~57 µs on localhost (more across the rack) and silt misses ~2.3 times
   per transaction. Most misses are first reads by new transactions: keys
   no recent block read. Those are exactly what a simulator of pending
@@ -486,7 +487,8 @@ yevm's trait. The core crate has **no yevm dependency**.
     - **D13's guarantee that no caller can inject values now rests on a
       ticket.** `ReadTouchSink::expect` runs in `context_for_payload`,
       which only the engine's payload validator calls. It leaves a
-      per-thread ticket naming (number, parent, transactions).
+      per-thread ticket naming (number, parent, transactions); since D16,
+      (number, block hash).
     - reth creates the executor for that payload right after, on the same
       thread, and the executor claims the ticket. At the end it reports
       the block it actually executed, and the sink accepts values only
@@ -511,6 +513,77 @@ yevm's trait. The core crate has **no yevm dependency**.
       validation would already be out. Measure first.
     - Starting D14's pool worker from the early event too, which would
       give it ~176 ms more per block.
+- **D16 — silt on stock reth alone (2026-11-23; the user's decision).** The
+  node silt ships with, `silt-exex`, is stock reth v2.11.0 running its own
+  evm2 executor, with no dependency on yevm. It switches with stock reth on
+  the same datadir, in both directions. Three changes get it there:
+  - **Read touches (D13) on the stock executor.** `silt_node::evm::
+    SiltEvmConfig` is reth's `EthEvmConfig`, unchanged, with one addition.
+    The EVM the engine executes a payload with reads its state through a
+    `Recording` database. `Recording` notes every account and slot the
+    block loads from below evm2's own state, with its value, and files
+    them in the sink when the EVM is dropped at the end of the block.
+    - **Which EVM records.** `context_for_payload`, which only the
+      engine's payload validator calls, leaves a ticket for the payload's
+      (number, hash) on its thread. The EVM created next on that thread
+      claims it: the block's own EVM, created right after, in the same
+      function. An EVM whose block number differs from the ticket's
+      records nothing and is counted as `mismatched`.
+      `context_for_block` clears any ticket, since blocks synced from the
+      network carry no read touches. RPC calls, prewarm workers and the
+      payload builder never hold a ticket and run unwrapped.
+    - **Values.** Everything the block loads from below its own writes is
+      the parent's state. For a key the block doesn't write, that is also
+      its value at the block, and the ExEx drops written keys. No caller's
+      overrides can reach it. A failed read files nothing. Repeats are
+      merged once.
+    - **reth 2.11's prewarm reuse is covered.** Before the engine reuses a
+      speculative result, it re-reads every key that result depended on
+      through the block's own database (`PrewarmResults::take_valid`).
+    - **Not covered: blocks with a block-level access list (EIP-7928).**
+      reth's parallel BAL path spreads such a block over several EVMs,
+      and only the first records. Those blocks would carry fewer read
+      touches, never wrong ones. None exist on mainnet yet.
+    - **Cost on the engine path:** one `Vec` push per state read, plus
+      moving the two vectors into the sink when the block ends. That move
+      is the "file µs" in the stats line. The conversion runs on the ExEx
+      thread.
+    - Keyed by (number, block hash), not (number, parent, transactions
+      digest): the engine checks the payload's hash against the block it
+      executes, so no transaction has to be hashed on the engine thread.
+  - **Early publishing (D15) in `silt-exex` too.** It forwards the
+    engine's events after launch, as yevm-node does.
+  - **Built like stock reth.**
+    - The same `main`: the jemalloc allocator, the account-extension
+      guard, the SIGSEGV handler, `EthereumBackfill`.
+    - The same default features: jemalloc, asm-keccak,
+      keccak-cache-global, gmp, js-tracer, otlp, portable. `jit` is left
+      out: evm2's JIT is off at runtime unless `--jit`, and building it
+      needs LLVM.
+    - reth's `release` and `maxperf` profiles.
+    - New lock entries are pinned to reth's own lock. That moved eight icu
+      crates back, from 2.4 to reth's 2.3, for js-tracer's boa.
+  - **D14 opt-in, in silt-node.** `pending_reads` (default false) starts
+    `silt_node::pending`'s worker from the silt ExEx. It runs on the
+    node's own EVM config (`ctx.evm_config()`, stock evm2 in silt-exex),
+    not on yevm.
+    - On each canonical head it runs up to 2,000 of the pool's best
+      transactions for at most 500 ms, each on the head's state, with
+      nothing committed.
+    - They run in reth's own predicted next-block environment
+      (`speculative_next_evm_env`, the one reth's pool prewarming uses),
+      with nonce and balance checks off.
+    - It records each key once, with its value, through a database
+      wrapper that also enforces the pass budget.
+    - The thread runs at nice 10 with the idle I/O class, off the import
+      path.
+    - The sink keeps D14's rules: the next diff takes what was read on its
+      parent, a 64-block resend window, at most 20,000 keys.
+    - Off by default, because it is extra execution on the node.
+  - **The engine's thread only moves vectors.** `Recording` files its raw
+    reads (`ReadTouchSink::put_deferred`). The conversion to wire values
+    and the per-block cap run when the ExEx takes them.
+  - **Wire.** Unchanged. `VERSION` stays 2.
 
 ## 1. Architecture
 
