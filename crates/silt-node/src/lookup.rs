@@ -16,19 +16,25 @@
 //! view of a block is reused by later requests at that same block for up
 //! to [`VIEW_REUSE`] (1 s), then dropped with its read transaction. Proofs
 //! (op 4, D10) run the same way on a second, smaller pool, so a proof walk
-//! (ms to s) never queues ahead of point reads (µs).
+//! (ms to s) never queues ahead of point reads (µs). Headers (op 5) and
+//! block transactions (op 6) are chain reads, not state reads: they run on
+//! the point-read pool, open no view and ignore the pin.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes};
-use reth_ethereum::provider::{ProviderError, StateProviderBox, StateProviderFactory};
+use alloy_rlp::Encodable;
+use reth_ethereum::provider::{
+    BlockReader, ProviderError, StateProviderBox, StateProviderFactory, TransactionVariant,
+};
 use reth_ethereum::trie::{MultiProof, MultiProofTargets};
 use silt_wire::lookup::{
-    self, FrameWriter, Item, ItemStatus, MAX_INFLIGHT, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Op,
-    ProofBuilder, ProofTarget, RequestRef, ResponseBuilder, Status,
+    self, FINALIZED, FrameWriter, Item, ItemStatus, MAX_INFLIGHT, MAX_REQUEST_BYTES,
+    MAX_RESPONSE_BYTES, Op, ProofBuilder, ProofTarget, RequestRef, ResponseBuilder, Status,
 };
 use silt_wire::{Addr, Frame, KECCAK_EMPTY, Word, hello, hello_mismatch, read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
@@ -63,6 +69,9 @@ impl std::fmt::Display for ReadError {
         }
     }
 }
+
+/// One block's transactions as `(sender, EIP-2718 bytes)`, in block order.
+pub type BlockTxs = Vec<(Addr, Vec<u8>)>;
 
 /// One consistent state snapshot at one block (one request frame).
 pub trait StateView {
@@ -100,6 +109,22 @@ pub trait StateSource: Send + Sync + 'static {
     fn open(&self, pin: Option<&Word>) -> Result<Opened<Self::View>, ReadError>;
     /// The block number "latest" reads at now (the proof depth bound, D10).
     fn head(&self) -> Result<u64, ReadError>;
+    /// RLP of a consensus header (op 5). `hash = Some`: the header with
+    /// that hash (`number` not checked). `None`: the canonical header at
+    /// `number`, or the finalized one if `number` is [`FINALIZED`].
+    /// `Ok(None)` = no such header (or no finalized block yet).
+    fn header(&self, number: u64, hash: Option<&Word>) -> Result<Option<Vec<u8>>, ReadError> {
+        let _ = (number, hash);
+        Err(ReadError::Other("this source serves no headers".into()))
+    }
+    /// The transactions of the block with this hash (op 6) as `(sender,
+    /// EIP-2718 bytes)` in block order. `Ok(None)` = no such block.
+    fn transactions(&self, block_hash: &Word) -> Result<Option<BlockTxs>, ReadError> {
+        let _ = block_hash;
+        Err(ReadError::Other(
+            "this source serves no transactions".into(),
+        ))
+    }
 }
 
 /// Maps reth's errors: everything that means "this block's state is not
@@ -331,7 +356,7 @@ impl StateView for NodeView {
 
 impl<P> StateSource for NodeSource<P>
 where
-    P: StateProviderFactory + Send + Sync + 'static,
+    P: StateProviderFactory + BlockReader + Send + Sync + 'static,
 {
     type View = NodeView;
 
@@ -393,6 +418,41 @@ where
 
     fn head(&self) -> Result<u64, ReadError> {
         Ok(self.provider.chain_info().map_err(classify)?.best_number)
+    }
+
+    fn header(&self, number: u64, hash: Option<&Word>) -> Result<Option<Vec<u8>>, ReadError> {
+        let header = match hash {
+            Some(hash) => self.provider.header(B256::from(*hash)),
+            None if number == FINALIZED => {
+                let Some(finalized) = self.provider.finalized_block_num_hash().map_err(classify)?
+                else {
+                    return Ok(None);
+                };
+                self.provider.header(finalized.hash)
+            }
+            None => self.provider.header_by_number(number),
+        }
+        .map_err(classify)?;
+        Ok(header.map(|h| {
+            let mut rlp = Vec::with_capacity(h.length());
+            h.encode(&mut rlp);
+            rlp
+        }))
+    }
+
+    fn transactions(&self, block_hash: &Word) -> Result<Option<BlockTxs>, ReadError> {
+        // Senders come from the database (or are recovered); tx hashes
+        // aren't needed to encode.
+        let block = self
+            .provider
+            .recovered_block(B256::from(*block_hash).into(), TransactionVariant::NoHash)
+            .map_err(classify)?;
+        Ok(block.map(|block| {
+            block
+                .transactions_with_sender()
+                .map(|(sender, tx)| (sender.0.0, tx.encoded_2718()))
+                .collect()
+        }))
     }
 }
 
@@ -727,10 +787,12 @@ fn answer<S: StateSource>(
     let req = RequestRef::decode(body).expect("validated by the reader");
     let fail =
         |status| lookup::error_response(req.op as u8, req.flags, req.id, status, micros(started));
-    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if req.op == Op::Proof {
-            prove(source, &req, proof_max_depth).map(|(b, n)| (Built::Proof(b), n))
-        } else {
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match req.op {
+        Op::Proof => prove(source, &req, proof_max_depth).map(|(b, n)| (Built::Proof(b), n)),
+        Op::Header | Op::Transactions => {
+            read_chain(source, &req).map(|(b, n)| (Built::Lookup(b), n))
+        }
+        Op::Account | Op::Storage | Op::Code => {
             read_all(source, &req).map(|(b, n)| (Built::Lookup(b), n))
         }
     }));
@@ -845,6 +907,9 @@ fn read_all<S: StateSource>(
                 Err(ReadError::Other(_)) => out.push_code(ItemStatus::Error, &[]),
             },
             Item::Proof(_) => unreachable!("Proof frames go to prove()"),
+            Item::Header { .. } | Item::Transactions { .. } => {
+                unreachable!("chain reads go to read_chain()")
+            }
         }
         if out.body_len() > MAX_RESPONSE_BYTES {
             break; // answered `TooLarge` by the caller
@@ -853,6 +918,48 @@ fn read_all<S: StateSource>(
     // The read transaction ends here, before the response is finished.
     drop(view);
     Ok((out, number))
+}
+
+/// One Header or Transactions frame: no state view, the pin ignored. The
+/// response names the head at the time of the read (`read_hash` zero);
+/// each item's failure is that item's `Error` only.
+fn read_chain<S: StateSource>(
+    source: &S,
+    req: &RequestRef<'_>,
+) -> Result<(ResponseBuilder, u64), ReadError> {
+    let head = source.head()?;
+    let mut out = ResponseBuilder::new(req.op, req.flags, req.id, head, &[0; 32], req.count());
+    for item in req.items() {
+        match item {
+            Item::Header { number, hash } => {
+                let hash = (*hash != [0; 32]).then_some(hash);
+                match source.header(number, hash) {
+                    Ok(Some(rlp)) => out.push_header(ItemStatus::Ok, &rlp),
+                    Ok(None) => out.push_header(ItemStatus::Absent, &[]),
+                    Err(err) => {
+                        tracing::debug!(id = req.id, number, %err, "silt lookup: header read failed");
+                        out.push_header(ItemStatus::Error, &[]);
+                    }
+                }
+            }
+            Item::Transactions { block_hash } => match source.transactions(block_hash) {
+                Ok(Some(txs)) => out.push_transactions(
+                    ItemStatus::Ok,
+                    txs.iter().map(|(sender, tx)| (sender, tx.as_slice())),
+                ),
+                Ok(None) => out.push_transactions(ItemStatus::Absent, std::iter::empty()),
+                Err(err) => {
+                    tracing::debug!(id = req.id, %err, "silt lookup: transactions read failed");
+                    out.push_transactions(ItemStatus::Error, std::iter::empty());
+                }
+            },
+            _ => unreachable!("op validated as Header or Transactions"),
+        }
+        if out.body_len() > MAX_RESPONSE_BYTES {
+            break; // answered `TooLarge` by the caller
+        }
+    }
+    Ok((out, head))
 }
 
 #[cfg(test)]
@@ -892,6 +999,16 @@ mod tests {
     const PROOF_SLOW: Word = [0x51; 32];
     const PROOF_HUGE: Word = [0x4B; 32];
     const PROOF_FAILS: Word = [0xFA; 32];
+    /// Header number whose read fails (item `Error`).
+    const FAILING_HEADER: u64 = 66;
+    /// Block hash whose transactions read fails (item `Error`).
+    const FAILING_BLOCK: Word = [0xFB; 32];
+    const TX_SENDERS: [Addr; 2] = [[0x5E; 20], [0x5F; 20]];
+
+    /// The header RLP the source serves for block `number`.
+    fn header_rlp(number: u64) -> Vec<u8> {
+        vec![0xF9, 0x02, number as u8]
+    }
 
     #[derive(Default)]
     struct Gate {
@@ -916,6 +1033,12 @@ mod tests {
 
     struct Data {
         storage: HashMap<(Addr, Word), Word>,
+        /// Canonical headers: (number, hash, RLP).
+        headers: Vec<(u64, Word, Vec<u8>)>,
+        /// The finalized block number, if any.
+        finalized: Mutex<Option<u64>>,
+        /// Block hash -> (sender, EIP-2718 bytes).
+        blocks: HashMap<Word, Vec<(Addr, Vec<u8>)>>,
         gate: Gate,
     }
 
@@ -1022,11 +1145,54 @@ mod tests {
         fn head(&self) -> Result<u64, ReadError> {
             Ok(HEAD.0)
         }
+        fn header(&self, number: u64, hash: Option<&Word>) -> Result<Option<Vec<u8>>, ReadError> {
+            let number = match hash {
+                Some(h) => match self.0.headers.iter().find(|(_, hh, _)| hh == h) {
+                    Some((n, ..)) => *n,
+                    None => return Ok(None),
+                },
+                None if number == FINALIZED => match *self.0.finalized.lock().unwrap() {
+                    Some(n) => n,
+                    None => return Ok(None),
+                },
+                None if number == FAILING_HEADER => {
+                    return Err(ReadError::Other("header on fire".into()));
+                }
+                None => number,
+            };
+            Ok(self
+                .0
+                .headers
+                .iter()
+                .find(|(n, ..)| *n == number)
+                .map(|(.., rlp)| rlp.clone()))
+        }
+        fn transactions(&self, block_hash: &Word) -> Result<Option<BlockTxs>, ReadError> {
+            if *block_hash == FAILING_BLOCK {
+                return Err(ReadError::Other("block on fire".into()));
+            }
+            Ok(self.0.blocks.get(block_hash).cloned())
+        }
     }
 
     fn server(cfg: LookupConfig) -> (Arc<LookupServer<MemSource>>, Arc<Data>) {
         let data = Arc::new(Data {
             storage: HashMap::from([((EOA, [2; 32]), [0x2A; 32])]),
+            headers: [PARENT, HEAD]
+                .into_iter()
+                .map(|(n, h)| (n, h, header_rlp(n)))
+                .collect(),
+            finalized: Mutex::new(Some(PARENT.0)),
+            blocks: HashMap::from([
+                (
+                    HEAD.1,
+                    vec![
+                        (TX_SENDERS[0], vec![0x02, 0xF8, 0x01]),
+                        (TX_SENDERS[1], vec![0xF8, 0x02]),
+                    ],
+                ),
+                (PARENT.1, vec![]),
+            ]),
             gate: Gate::default(),
         });
         let s = LookupServer::new(MemSource(data.clone()), CHAIN_ID, GENESIS, cfg).unwrap();
@@ -1574,6 +1740,110 @@ mod tests {
         send(&mut c, b.finish()).await;
         let r = recv(&mut c).await;
         assert_eq!(ResponseRef::decode(&r).unwrap().status, Status::TooLarge);
+    }
+
+    fn header_req(id: u32, pin: &Word, items: &[(u64, Word)]) -> Vec<u8> {
+        let mut b = RequestBuilder::new(Op::Header, 0, id, pin);
+        for (number, hash) in items {
+            b.push_header(*number, hash);
+        }
+        b.finish()
+    }
+
+    fn header_results(body: &[u8]) -> Vec<(ItemStatus, Vec<u8>)> {
+        let r = ResponseRef::decode(body).unwrap();
+        assert_eq!(
+            (r.status, r.read_number, *r.read_hash),
+            (Status::Ok, HEAD.0, [0; 32])
+        );
+        r.results()
+            .map(|res| match res {
+                ResultRef::Header { status, rlp } => (status, rlp.to_vec()),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn headers_by_number_hash_and_finalized_ignore_the_pin() {
+        let (s, data) = server(LookupConfig::default());
+        let (mut c, _task) = connect(&s).await;
+        let items = [
+            (HEAD.0, [0; 32]),         // canonical by number
+            (12345, PARENT.1),         // by hash: number not checked
+            (FINALIZED, [0; 32]),      // finalized = PARENT
+            (5000, [0; 32]),           // no such number
+            (HEAD.0, [0x77; 32]),      // no such hash
+            (FAILING_HEADER, [0; 32]), // read fails: this item only
+        ];
+        let want = [
+            (ItemStatus::Ok, header_rlp(HEAD.0)),
+            (ItemStatus::Ok, header_rlp(PARENT.0)),
+            (ItemStatus::Ok, header_rlp(PARENT.0)),
+            (ItemStatus::Absent, vec![]),
+            (ItemStatus::Absent, vec![]),
+            (ItemStatus::Error, vec![]),
+        ];
+        // The pin is ignored: latest, an unknown block and a pin whose
+        // open fails all read the same headers.
+        for (id, pin) in [(1, LATEST), (2, [0x33; 32]), (3, BROKEN_PIN)] {
+            send(&mut c, header_req(id, &pin, &items)).await;
+            let body = recv(&mut c).await;
+            assert_eq!(ResponseRef::decode(&body).unwrap().id, id);
+            assert_eq!(header_results(&body), want, "pin {pin:?}");
+        }
+        // No finalized block yet: Absent.
+        *data.finalized.lock().unwrap() = None;
+        send(&mut c, header_req(4, &LATEST, &[(FINALIZED, [0; 32])])).await;
+        assert_eq!(
+            header_results(&recv(&mut c).await),
+            [(ItemStatus::Absent, vec![])]
+        );
+    }
+
+    #[tokio::test]
+    async fn transactions_by_block_hash_with_senders_ignore_the_pin() {
+        let (s, _) = server(LookupConfig::default());
+        let (mut c, _task) = connect(&s).await;
+        for (id, pin) in [(1, LATEST), (2, [0x33; 32])] {
+            let mut b = RequestBuilder::new(Op::Transactions, 0, id, &pin);
+            b.push_transactions(&HEAD.1)
+                .push_transactions(&PARENT.1)
+                .push_transactions(&[0x77; 32])
+                .push_transactions(&FAILING_BLOCK);
+            send(&mut c, b.finish()).await;
+            let body = recv(&mut c).await;
+            let r = ResponseRef::decode(&body).unwrap();
+            assert_eq!(
+                (r.id, r.status, r.read_number, *r.read_hash),
+                (id, Status::Ok, HEAD.0, [0; 32])
+            );
+            let got: Vec<_> = r
+                .results()
+                .map(|res| match res {
+                    ResultRef::Transactions { status, txs } => (
+                        status,
+                        txs.map(|(a, tx)| (*a, tx.to_vec())).collect::<Vec<_>>(),
+                    ),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    (
+                        ItemStatus::Ok,
+                        vec![
+                            (TX_SENDERS[0], vec![0x02, 0xF8, 0x01]),
+                            (TX_SENDERS[1], vec![0xF8, 0x02]),
+                        ]
+                    ),
+                    (ItemStatus::Ok, vec![]), // a block without transactions
+                    (ItemStatus::Absent, vec![]), // no such block
+                    (ItemStatus::Error, vec![]), // read fails: this item only
+                ]
+            );
+        }
     }
 
     #[tokio::test]

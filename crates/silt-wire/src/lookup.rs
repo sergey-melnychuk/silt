@@ -1,5 +1,6 @@
 //! Lookup fast path (PLAN D9, D10): a fixed little-endian request/response
-//! layout for tip-state reads and trie proofs, written by hand.
+//! layout for tip-state reads, trie proofs, block headers and block
+//! transactions, written by hand.
 //!
 //! No postcard, serde or varints here: every field sits at a fixed offset,
 //! so [`RequestRef::decode`] and [`ResponseRef::decode`] only check lengths
@@ -10,6 +11,10 @@
 //! request  (40 B header): u8 op | u8 flags | u16 count | u32 id | [32] pin_hash | count × item
 //!   items: Account [20] addr | Storage [20] addr,[32] slot | Code [32] code_hash
 //!          Proof   [32] hashed_address, u16 slot_count, [2] reserved, slot_count × [32] hashed_slot
+//!          Header  u64 number, [32] hash   (zero hash: canonical at `number`,
+//!                                           or the finalized header if `number = FINALIZED`)
+//!          Transactions [32] block_hash
+//!   Header and Transactions ignore the pin (clients send LATEST).
 //! response (56 B header): u8 op | u8 flags | u16 count | u32 id
 //!                         | u8 status | [3] reserved | u32 server_us
 //!                         | u64 read_number | [32] read_hash | count × result
@@ -17,6 +22,10 @@
 //!     Account: u64 nonce, [32] balance, [32] code_hash [+ u32 code_len, code iff INLINE_CODE]
 //!     Storage: [32] value
 //!     Code:    u32 len, bytes
+//!     Header:  u32 len, RLP of the consensus header
+//!     Transactions: u32 tx_count, tx_count × ([20] sender, u32 len, EIP-2718 bytes)
+//!   Header and Transactions answers: read_number = the server's head when
+//!   it read, read_hash all-zero. Absent/Error items carry len/count 0.
 //!   Proof (count = storage tries; no per-item results):
 //!     u32 account_nodes, account_nodes × node,
 //!     count × ([32] hashed_address, [32] storage_root, u32 nodes, nodes × node)
@@ -55,18 +64,35 @@ pub const CODE_ITEM: usize = 32;
 /// Fixed part of a Proof item: `hashed_address, slot_count, reserved`;
 /// `slot_count × 32` bytes of hashed slots follow.
 pub const PROOF_TARGET: usize = 32 + 2 + 2;
+/// `number, hash`; an all-zero hash means "canonical at `number`".
+pub const HEADER_ITEM: usize = 8 + 32;
+/// `block_hash`.
+pub const TRANSACTIONS_ITEM: usize = 32;
+/// Header item `number` that, with an all-zero hash, asks for the
+/// finalized header.
+pub const FINALIZED: u64 = u64::MAX;
 
 /// `item_status, nonce, balance, code_hash` (+ `u32 code_len, code` inline).
 pub const ACCOUNT_RESULT: usize = 1 + 8 + 32 + 32;
 pub const STORAGE_RESULT: usize = 1 + 32;
 /// `item_status, len` (+ `len` bytes).
 pub const CODE_RESULT_HEADER: usize = 1 + 4;
+/// `item_status, len` (+ `len` bytes of header RLP).
+pub const HEADER_RESULT_HEADER: usize = 1 + 4;
+/// `item_status, tx_count` (+ `tx_count` × `[20] sender, u32 len, bytes`).
+pub const TRANSACTIONS_RESULT_HEADER: usize = 1 + 4;
+/// Fixed part of one transaction in a Transactions result: `sender, len`.
+pub const TX_ENTRY_HEADER: usize = 20 + 4;
 
 /// Items per frame for Account (without inline code) and Storage.
 pub const MAX_ITEMS: usize = 1024;
 /// Items per frame for Code and Account + `INLINE_CODE`: 64 × a 256 KiB
 /// contract still fits [`MAX_RESPONSE_BYTES`] (10× EIP-170 headroom).
 pub const MAX_CODE_ITEMS: usize = 64;
+/// Items per frame for Header.
+pub const MAX_HEADER_ITEMS: usize = 256;
+/// Blocks per frame for Transactions.
+pub const MAX_TRANSACTIONS_ITEMS: usize = 16;
 /// Hashed slots across all targets of one Proof frame (D10).
 pub const MAX_PROOF_SLOTS: usize = 4096;
 /// A trie path is at most 64 nibbles (a full 32-byte key).
@@ -89,6 +115,10 @@ pub enum Op {
     Code = 3,
     /// Multiproof for pre-hashed targets (D10).
     Proof = 4,
+    /// Block headers by number or hash (pin ignored).
+    Header = 5,
+    /// The transactions of one block by hash, with senders (pin ignored).
+    Transactions = 6,
 }
 
 impl Op {
@@ -98,6 +128,8 @@ impl Op {
             2 => Some(Self::Storage),
             3 => Some(Self::Code),
             4 => Some(Self::Proof),
+            5 => Some(Self::Header),
+            6 => Some(Self::Transactions),
             _ => None,
         }
     }
@@ -109,6 +141,8 @@ impl Op {
             Self::Storage => STORAGE_ITEM,
             Self::Code => CODE_ITEM,
             Self::Proof => PROOF_TARGET,
+            Self::Header => HEADER_ITEM,
+            Self::Transactions => TRANSACTIONS_ITEM,
         }
     }
 
@@ -119,6 +153,8 @@ impl Op {
             Self::Account if flags & FLAG_INLINE_CODE != 0 => MAX_CODE_ITEMS,
             Self::Account | Self::Storage | Self::Proof => MAX_ITEMS,
             Self::Code => MAX_CODE_ITEMS,
+            Self::Header => MAX_HEADER_ITEMS,
+            Self::Transactions => MAX_TRANSACTIONS_ITEMS,
         }
     }
 }
@@ -158,10 +194,11 @@ impl Status {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ItemStatus {
-    /// Account exists / code found / storage read (missing slot = zero).
+    /// Account exists / code, header or block found / storage read
+    /// (missing slot = zero).
     Ok = 0,
-    /// No such account (zeroed fields, `KECCAK_EMPTY`) or no such code.
-    /// Never sent for Storage.
+    /// No such account (zeroed fields, `KECCAK_EMPTY`), code, header or
+    /// block. Never sent for Storage.
     Absent = 1,
     Error = 2,
 }
@@ -271,6 +308,16 @@ pub enum Item<'a> {
     Storage(&'a Addr, &'a Word),
     Code(&'a Word),
     Proof(ProofTarget<'a>),
+    /// All-zero `hash`: the canonical header at `number` (the finalized
+    /// one if `number` is [`FINALIZED`]); otherwise the header with that
+    /// hash, `number` not checked.
+    Header {
+        number: u64,
+        hash: &'a Word,
+    },
+    Transactions {
+        block_hash: &'a Word,
+    },
 }
 
 /// One Proof target: a hashed address and the hashed slots to prove under
@@ -407,6 +454,19 @@ impl<'a> Iterator for Items<'a> {
             Op::Account => (Item::Account(addr_at(b, 0)), ACCOUNT_ITEM),
             Op::Storage => (Item::Storage(addr_at(b, 0), word_at(b, 20)), STORAGE_ITEM),
             Op::Code => (Item::Code(word_at(b, 0)), CODE_ITEM),
+            Op::Header => (
+                Item::Header {
+                    number: u64_at(b, 0),
+                    hash: word_at(b, 8),
+                },
+                HEADER_ITEM,
+            ),
+            Op::Transactions => (
+                Item::Transactions {
+                    block_hash: word_at(b, 0),
+                },
+                TRANSACTIONS_ITEM,
+            ),
             Op::Proof => {
                 let end = PROOF_TARGET + u16_at(b, 32) as usize * 32;
                 let target = ProofTarget {
@@ -502,6 +562,21 @@ impl RequestBuilder {
         self
     }
 
+    /// All-zero `hash`: the canonical header at `number` ([`FINALIZED`]:
+    /// the finalized header); otherwise the header with that hash.
+    pub fn push_header(&mut self, number: u64, hash: &Word) -> &mut Self {
+        self.bump(Op::Header);
+        self.buf.extend_from_slice(&number.to_le_bytes());
+        self.buf.extend_from_slice(hash);
+        self
+    }
+
+    pub fn push_transactions(&mut self, block_hash: &Word) -> &mut Self {
+        self.bump(Op::Transactions);
+        self.buf.extend_from_slice(block_hash);
+        self
+    }
+
     /// One Proof target. Panics past the caps (check
     /// [`Self::fits_proof_target`]).
     pub fn push_proof_target(&mut self, hashed_address: &Word, hashed_slots: &[Word]) -> &mut Self {
@@ -529,6 +604,8 @@ impl RequestBuilder {
             Item::Storage(addr, slot) => self.push_storage(addr, slot),
             Item::Code(hash) => self.push_code(hash),
             Item::Proof(t) => self.push_proof_raw(t.hashed_address, t.slots),
+            Item::Header { number, hash } => self.push_header(number, hash),
+            Item::Transactions { block_hash } => self.push_transactions(block_hash),
         }
     }
 
@@ -568,6 +645,8 @@ impl ResponseBuilder {
             Op::Account => ACCOUNT_RESULT,
             Op::Storage => STORAGE_RESULT,
             Op::Code => CODE_RESULT_HEADER,
+            Op::Header => HEADER_RESULT_HEADER,
+            Op::Transactions => TRANSACTIONS_RESULT_HEADER,
             Op::Proof => panic!("Proof answers are built with ProofBuilder"),
         };
         let mut buf = Vec::with_capacity(4 + RESPONSE_HEADER + capacity * per_item);
@@ -635,6 +714,34 @@ impl ResponseBuilder {
         self.buf
             .extend_from_slice(&(code.len() as u32).to_le_bytes());
         self.buf.extend_from_slice(code);
+    }
+
+    /// `rlp`: the RLP encoding of the consensus header (empty for
+    /// `Absent`/`Error`).
+    pub fn push_header(&mut self, status: ItemStatus, rlp: &[u8]) {
+        self.bump(Op::Header);
+        self.buf.push(status as u8);
+        self.buf
+            .extend_from_slice(&(rlp.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(rlp);
+    }
+
+    /// One block's transactions as `(sender, EIP-2718 bytes)` (none for
+    /// `Absent`/`Error`).
+    pub fn push_transactions<'a>(
+        &mut self,
+        status: ItemStatus,
+        txs: impl ExactSizeIterator<Item = (&'a Addr, &'a [u8])>,
+    ) {
+        self.bump(Op::Transactions);
+        self.buf.push(status as u8);
+        let count = u32::try_from(txs.len()).expect("u32 transaction count");
+        self.buf.extend_from_slice(&count.to_le_bytes());
+        for (sender, tx) in txs {
+            self.buf.extend_from_slice(sender);
+            self.buf.extend_from_slice(&(tx.len() as u32).to_le_bytes());
+            self.buf.extend_from_slice(tx);
+        }
     }
 
     /// Body bytes so far (compare against [`MAX_RESPONSE_BYTES`]).
@@ -815,6 +922,16 @@ pub enum ResultRef<'a> {
         status: ItemStatus,
         code: &'a [u8],
     },
+    Header {
+        status: ItemStatus,
+        /// RLP of the consensus header; empty unless `Ok`.
+        rlp: &'a [u8],
+    },
+    Transactions {
+        status: ItemStatus,
+        /// `(sender, EIP-2718 bytes)` in block order; empty unless `Ok`.
+        txs: Txs<'a>,
+    },
 }
 
 /// A validated response, borrowing the frame body. Decoding walks the
@@ -891,12 +1008,19 @@ impl<'a> ResponseRef<'a> {
                         .ok_or(DecodeError::Truncated)?;
                     (results.get(at).copied(), head + code_len)
                 }
-                Op::Code => {
-                    let code_len = results
+                Op::Code | Op::Header => {
+                    let len = results
                         .get(at + 1..at + CODE_RESULT_HEADER)
                         .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
                         .ok_or(DecodeError::Truncated)?;
-                    (results.get(at).copied(), CODE_RESULT_HEADER + code_len)
+                    (results.get(at).copied(), CODE_RESULT_HEADER + len)
+                }
+                Op::Transactions => {
+                    let used = results
+                        .get(at..)
+                        .ok_or(DecodeError::Truncated)
+                        .and_then(check_txs)?;
+                    (results.get(at).copied(), used)
                 }
                 Op::Proof => unreachable!("validated by check_proof"),
             };
@@ -991,6 +1115,67 @@ fn check_proof(results: &[u8], count: u16) -> Result<(), DecodeError> {
     }
     Ok(())
 }
+
+/// Validates one Transactions result at the start of `b` (`item_status`,
+/// `u32 tx_count`, the entries); returns the bytes it occupies. Every
+/// entry is at least [`TX_ENTRY_HEADER`] bytes, so a huge `tx_count` runs
+/// out of input long before it runs out of loop.
+fn check_txs(b: &[u8]) -> Result<usize, DecodeError> {
+    let n = b
+        .get(1..TRANSACTIONS_RESULT_HEADER)
+        .map(|x| u32_at(x, 0))
+        .ok_or(DecodeError::Truncated)?;
+    let mut at = TRANSACTIONS_RESULT_HEADER;
+    for _ in 0..n {
+        let len = b
+            .get(at + 20..at + TX_ENTRY_HEADER)
+            .map(|x| u32_at(x, 0) as usize)
+            .ok_or(DecodeError::Truncated)?;
+        at = at
+            .checked_add(TX_ENTRY_HEADER + len)
+            .filter(|&end| end <= b.len())
+            .ok_or(DecodeError::Truncated)?;
+    }
+    Ok(at)
+}
+
+/// Bytes `n` validated transaction entries occupy at the start of `b`.
+fn txs_len(b: &[u8], n: u32) -> usize {
+    let mut at = 0;
+    for _ in 0..n {
+        at += TX_ENTRY_HEADER + u32_at(b, at + 20) as usize;
+    }
+    at
+}
+
+/// The transactions of one validated Transactions result: `(sender,
+/// EIP-2718 bytes)` in block order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Txs<'a> {
+    left: u32,
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for Txs<'a> {
+    type Item = (&'a Addr, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        let b = self.rest;
+        let len = u32_at(b, 20) as usize;
+        self.rest = &b[TX_ENTRY_HEADER + len..];
+        Some((addr_at(b, 0), &b[TX_ENTRY_HEADER..TX_ENTRY_HEADER + len]))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left as usize, Some(self.left as usize))
+    }
+}
+
+impl ExactSizeIterator for Txs<'_> {}
 
 /// Bytes `n` validated nodes occupy at the start of `b`.
 fn nodes_len(b: &[u8], n: u32) -> usize {
@@ -1201,6 +1386,30 @@ impl<'a> Iterator for Results<'a> {
                         code: &b[CODE_RESULT_HEADER..CODE_RESULT_HEADER + len],
                     },
                     CODE_RESULT_HEADER + len,
+                )
+            }
+            Op::Header => {
+                let len = u32_at(b, 1) as usize;
+                (
+                    ResultRef::Header {
+                        status,
+                        rlp: &b[HEADER_RESULT_HEADER..HEADER_RESULT_HEADER + len],
+                    },
+                    HEADER_RESULT_HEADER + len,
+                )
+            }
+            Op::Transactions => {
+                let n = u32_at(b, 1);
+                let end = TRANSACTIONS_RESULT_HEADER + txs_len(&b[TRANSACTIONS_RESULT_HEADER..], n);
+                (
+                    ResultRef::Transactions {
+                        status,
+                        txs: Txs {
+                            left: n,
+                            rest: &b[TRANSACTIONS_RESULT_HEADER..end],
+                        },
+                    },
+                    end,
                 )
             }
             Op::Proof => unreachable!("Proof responses have no per-item results"),
@@ -1492,10 +1701,12 @@ mod tests {
         Storage(Addr, Word),
         Code(Word),
         Proof(Word, Vec<Word>),
+        Header(u64, Word),
+        Transactions(Word),
     }
 
     fn random_request(rng: &mut Rng) -> (Op, u8, u32, Word, Vec<OwnedItem>) {
-        let op = Op::from_u8(1 + rng.below(4) as u8).unwrap();
+        let op = Op::from_u8(1 + rng.below(6) as u8).unwrap();
         let flags = if op == Op::Account && rng.below(2) == 0 {
             FLAG_INLINE_CODE
         } else {
@@ -1513,6 +1724,12 @@ mod tests {
                 Op::Account => OwnedItem::Account(rng.addr()),
                 Op::Storage => OwnedItem::Storage(rng.addr(), rng.word()),
                 Op::Code => OwnedItem::Code(rng.word()),
+                Op::Header => match rng.below(3) {
+                    0 => OwnedItem::Header(rng.next(), rng.word()),
+                    1 => OwnedItem::Header(FINALIZED, [0; 32]),
+                    _ => OwnedItem::Header(rng.next(), [0; 32]),
+                },
+                Op::Transactions => OwnedItem::Transactions(rng.word()),
                 Op::Proof => {
                     // Mostly a few slots, sometimes many, never past the cap.
                     let want = match rng.below(20) {
@@ -1536,6 +1753,8 @@ mod tests {
                 OwnedItem::Storage(a, s) => b.push_storage(a, s),
                 OwnedItem::Code(h) => b.push_code(h),
                 OwnedItem::Proof(a, slots) => b.push_proof_target(a, slots),
+                OwnedItem::Header(n, h) => b.push_header(*n, h),
+                OwnedItem::Transactions(h) => b.push_transactions(h),
             };
         }
         b.finish()
@@ -1567,6 +1786,8 @@ mod tests {
                         assert_eq!(t.slots().len(), t.slot_count());
                         OwnedItem::Proof(*t.hashed_address, t.slots().copied().collect())
                     }
+                    Item::Header { number, hash } => OwnedItem::Header(number, *hash),
+                    Item::Transactions { block_hash } => OwnedItem::Transactions(*block_hash),
                 })
                 .collect();
             assert_eq!(back, items, "iteration {i}");
@@ -1579,6 +1800,8 @@ mod tests {
         Account(ItemStatus, u64, Word, Word, Option<Vec<u8>>),
         Storage(ItemStatus, Word),
         Code(ItemStatus, Vec<u8>),
+        Header(ItemStatus, Vec<u8>),
+        Transactions(ItemStatus, Vec<(Addr, Vec<u8>)>),
     }
 
     fn item_status(rng: &mut Rng) -> ItemStatus {
@@ -1597,7 +1820,14 @@ mod tests {
     }
 
     fn random_response(rng: &mut Rng) -> Model {
-        let op = Op::from_u8(1 + rng.below(3) as u8).unwrap();
+        let ops = [
+            Op::Account,
+            Op::Storage,
+            Op::Code,
+            Op::Header,
+            Op::Transactions,
+        ];
+        let op = ops[rng.below(ops.len() as u64) as usize];
         let flags = if op == Op::Account && rng.below(2) == 0 {
             FLAG_INLINE_CODE
         } else {
@@ -1621,7 +1851,13 @@ mod tests {
                     ),
                     Op::Storage => OwnedResult::Storage(item_status(rng), rng.word()),
                     Op::Code => OwnedResult::Code(item_status(rng), rng.bytes(300)),
-                    Op::Proof => unreachable!("ops 1-3 only; proofs: random_proof"),
+                    Op::Header => OwnedResult::Header(item_status(rng), rng.bytes(600)),
+                    Op::Transactions => {
+                        let n = rng.below(6) as usize;
+                        let txs = (0..n).map(|_| (rng.addr(), rng.bytes(200))).collect();
+                        OwnedResult::Transactions(item_status(rng), txs)
+                    }
+                    Op::Proof => unreachable!("no proofs here; proofs: random_proof"),
                 })
                 .collect();
             (rng.next(), rng.word(), results)
@@ -1659,6 +1895,10 @@ mod tests {
                 }
                 OwnedResult::Storage(s, v) => b.push_storage(*s, v),
                 OwnedResult::Code(s, code) => b.push_code(*s, code),
+                OwnedResult::Header(s, rlp) => b.push_header(*s, rlp),
+                OwnedResult::Transactions(s, txs) => {
+                    b.push_transactions(*s, txs.iter().map(|(a, tx)| (a, tx.as_slice())))
+                }
             }
         }
         b.finish(m.server_us)
@@ -1681,6 +1921,11 @@ mod tests {
             ),
             ResultRef::Storage { status, value } => OwnedResult::Storage(status, *value),
             ResultRef::Code { status, code } => OwnedResult::Code(status, code.to_vec()),
+            ResultRef::Header { status, rlp } => OwnedResult::Header(status, rlp.to_vec()),
+            ResultRef::Transactions { status, txs } => {
+                assert_eq!(txs.len(), txs.count());
+                OwnedResult::Transactions(status, txs.map(|(a, tx)| (*a, tx.to_vec())).collect())
+            }
         }
     }
 
@@ -1860,6 +2105,8 @@ mod tests {
             (Op::Storage, 0),
             (Op::Code, 0),
             (Op::Proof, 0),
+            (Op::Header, 0),
+            (Op::Transactions, 0),
         ] {
             let cap = op.max_items(flags);
             let mut b = RequestBuilder::new(op, flags, 1, &LATEST).finish();
@@ -1919,8 +2166,8 @@ mod tests {
         let mut b = good[4..].to_vec();
         b[0] = 0;
         assert_eq!(RequestRef::decode(&b).unwrap_err(), DecodeError::BadOp(0));
-        b[0] = 5;
-        assert_eq!(RequestRef::decode(&b).unwrap_err(), DecodeError::BadOp(5));
+        b[0] = 7;
+        assert_eq!(RequestRef::decode(&b).unwrap_err(), DecodeError::BadOp(7));
         let mut b = good[4..].to_vec();
         b[1] = FLAG_INLINE_CODE; // inline code on a Storage op
         assert_eq!(
@@ -2097,6 +2344,186 @@ mod tests {
         assert_eq!(resp.results().count(), 0);
         assert_eq!(peek_prefix(&e[4..]), Some((9, 0x80, 3)));
         assert_eq!(peek_prefix(&e[4..11]), None);
+    }
+
+    /// Header (op 5) and Transactions (op 6): golden bytes, round trips,
+    /// truncated results, lengths that disagree with the body, item caps.
+    #[test]
+    fn header_and_transactions_layout_and_validation() {
+        // Requests: u64 number LE then the hash; a block hash.
+        let mut b = RequestBuilder::new(Op::Header, 0, 3, &LATEST);
+        b.push_header(0x0102, &[0; 32])
+            .push(Item::Header {
+                number: FINALIZED,
+                hash: &[0; 32],
+            })
+            .push_header(7, &[0xAA; 32]);
+        let f = b.finish();
+        assert_eq!(&f[..4], &(40u32 + 3 * 40).to_le_bytes());
+        assert_eq!(&f[4..12], &[5, 0, 3, 0, 3, 0, 0, 0]);
+        assert_eq!(&f[44..52], &0x0102u64.to_le_bytes());
+        assert_eq!(&f[52..84], &[0; 32]);
+        assert_eq!(&f[84..92], &[0xFF; 8]);
+        let req = RequestRef::decode(&f[4..]).unwrap();
+        assert_eq!(
+            req.items().collect::<Vec<_>>(),
+            [
+                Item::Header {
+                    number: 0x0102,
+                    hash: &[0; 32]
+                },
+                Item::Header {
+                    number: FINALIZED,
+                    hash: &[0; 32]
+                },
+                Item::Header {
+                    number: 7,
+                    hash: &[0xAA; 32]
+                },
+            ]
+        );
+        let mut b = RequestBuilder::new(Op::Transactions, 0, 4, &LATEST);
+        b.push_transactions(&[0xBB; 32]);
+        let f = b.finish();
+        assert_eq!(&f[..4], &(40u32 + 32).to_le_bytes());
+        assert_eq!(&f[4..8], &[6, 0, 1, 0]);
+        assert_eq!(&f[44..76], &[0xBB; 32]);
+        let req = RequestRef::decode(&f[4..]).unwrap();
+        assert_eq!(
+            req.items().collect::<Vec<_>>(),
+            [Item::Transactions {
+                block_hash: &[0xBB; 32]
+            }]
+        );
+
+        // Header answers: status, u32 len, RLP.
+        let mut b = ResponseBuilder::new(Op::Header, 0, 3, 100, &[0; 32], 3);
+        b.push_header(ItemStatus::Ok, &[0xF9, 0x02, 0x10]);
+        b.push_header(ItemStatus::Absent, &[]);
+        b.push_header(ItemStatus::Error, &[]);
+        let f = b.finish(9);
+        let r = &f[4 + RESPONSE_HEADER..];
+        assert_eq!(&r[..8], &[0, 3, 0, 0, 0, 0xF9, 0x02, 0x10]);
+        assert_eq!(&r[8..], &[1, 0, 0, 0, 0, 2, 0, 0, 0, 0]);
+        let resp = ResponseRef::decode(&f[4..]).unwrap();
+        assert_eq!((resp.read_number, *resp.read_hash), (100, [0; 32]));
+        assert_eq!(
+            resp.results().collect::<Vec<_>>(),
+            [
+                ResultRef::Header {
+                    status: ItemStatus::Ok,
+                    rlp: &[0xF9, 0x02, 0x10]
+                },
+                ResultRef::Header {
+                    status: ItemStatus::Absent,
+                    rlp: &[]
+                },
+                ResultRef::Header {
+                    status: ItemStatus::Error,
+                    rlp: &[]
+                },
+            ]
+        );
+        let good = f[4..].to_vec();
+        // A length past the end: truncated; short of it: trailing bytes.
+        let mut bad = good.clone();
+        bad[RESPONSE_HEADER + 1..RESPONSE_HEADER + 5].copy_from_slice(&4u32.to_le_bytes());
+        assert!(ResponseRef::decode(&bad).is_err());
+        let mut bad = good.clone();
+        bad[RESPONSE_HEADER + 1..RESPONSE_HEADER + 5].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            ResponseRef::decode(&bad).unwrap_err(),
+            DecodeError::Truncated
+        );
+        let mut bad = good.clone();
+        bad[RESPONSE_HEADER + 1..RESPONSE_HEADER + 5].copy_from_slice(&2u32.to_le_bytes());
+        assert!(ResponseRef::decode(&bad).is_err());
+        for cut in RESPONSE_HEADER..good.len() {
+            assert!(ResponseRef::decode(&good[..cut]).is_err(), "cut {cut}");
+        }
+
+        // Transactions answers: status, u32 count, (sender, u32 len, bytes)*.
+        let txs: [(Addr, Vec<u8>); 2] = [([0x11; 20], vec![0x02, 0xF8]), ([0x22; 20], vec![])];
+        let mut b = ResponseBuilder::new(Op::Transactions, 0, 4, 100, &[0; 32], 2);
+        b.push_transactions(ItemStatus::Ok, txs.iter().map(|(a, t)| (a, t.as_slice())));
+        b.push_transactions(ItemStatus::Absent, std::iter::empty());
+        let f = b.finish(9);
+        let r = &f[4 + RESPONSE_HEADER..];
+        assert_eq!(&r[..5], &[0, 2, 0, 0, 0]);
+        assert_eq!(&r[5..25], &[0x11; 20]);
+        assert_eq!(&r[25..31], &[2, 0, 0, 0, 0x02, 0xF8]);
+        assert_eq!(&r[31..51], &[0x22; 20]);
+        assert_eq!(&r[51..55], &[0, 0, 0, 0]);
+        assert_eq!(&r[55..], &[1, 0, 0, 0, 0]);
+        let resp = ResponseRef::decode(&f[4..]).unwrap();
+        let res: Vec<_> = resp.results().collect();
+        let ResultRef::Transactions {
+            status: ItemStatus::Ok,
+            txs: got,
+        } = res[0]
+        else {
+            panic!("{:?}", res[0]);
+        };
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got.collect::<Vec<_>>(),
+            [(&[0x11; 20], &[0x02, 0xF8][..]), (&[0x22; 20], &[][..])]
+        );
+        let ResultRef::Transactions {
+            status: ItemStatus::Absent,
+            txs: none,
+        } = res[1]
+        else {
+            panic!("{:?}", res[1]);
+        };
+        assert_eq!(none.len(), 0);
+        let good = f[4..].to_vec();
+        for cut in RESPONSE_HEADER..good.len() {
+            assert!(ResponseRef::decode(&good[..cut]).is_err(), "cut {cut}");
+        }
+        // A transaction length past the end, a huge count, a count too low.
+        let mut bad = good.clone();
+        let len_at = RESPONSE_HEADER + 5 + 20;
+        bad[len_at..len_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            ResponseRef::decode(&bad).unwrap_err(),
+            DecodeError::Truncated
+        );
+        let mut bad = good.clone();
+        bad[RESPONSE_HEADER + 1..RESPONSE_HEADER + 5].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            ResponseRef::decode(&bad).unwrap_err(),
+            DecodeError::Truncated
+        );
+        let mut bad = good.clone();
+        bad[RESPONSE_HEADER + 1..RESPONSE_HEADER + 5].copy_from_slice(&1u32.to_le_bytes());
+        assert!(ResponseRef::decode(&bad).is_err());
+
+        // Item caps, both directions.
+        assert_eq!(Op::Header.max_items(0), MAX_HEADER_ITEMS);
+        assert_eq!(Op::Transactions.max_items(0), MAX_TRANSACTIONS_ITEMS);
+        let mut b = RequestBuilder::new(Op::Header, 0, 1, &LATEST);
+        while !b.is_full() {
+            b.push_header(1, &[0; 32]);
+        }
+        assert_eq!(b.len(), MAX_HEADER_ITEMS);
+        let full = b.finish();
+        assert_eq!(
+            RequestRef::decode(&full[4..]).unwrap().count(),
+            MAX_HEADER_ITEMS
+        );
+        for (op, cap) in [
+            (Op::Header, MAX_HEADER_ITEMS),
+            (Op::Transactions, MAX_TRANSACTIONS_ITEMS),
+        ] {
+            let mut r = ResponseBuilder::new(op, 0, 1, 1, &[0; 32], 0).finish(0)[4..].to_vec();
+            r[2..4].copy_from_slice(&(cap as u16 + 1).to_le_bytes());
+            r.resize(RESPONSE_HEADER + (cap + 1) * 5, 0);
+            assert_eq!(
+                ResponseRef::decode(&r).unwrap_err(),
+                DecodeError::TooManyItems(cap as u16 + 1)
+            );
+        }
     }
 
     /// Fast path, backlog under a stalled reader, ordering preserved, guards

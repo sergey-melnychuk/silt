@@ -21,6 +21,8 @@ alloy-primitives = { version = "1", features = ["serde"] }
 # D16: decoding payload transactions exactly as reth's stock EVM config does
 # (the same alloy-eips as the pinned reth).
 alloy-eips = { version = "2.5", default-features = false }
+# Header answers (op 5) are the RLP of reth's consensus header.
+alloy-rlp = { version = "0.3", default-features = false }
 # D14's pool worker lowers its own thread's CPU and I/O priority.
 libc = "0.2"
 

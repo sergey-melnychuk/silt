@@ -916,6 +916,10 @@ mod tests {
                     out.push_account(ItemStatus::Ok, a[0] as u64, &[a[0]; 32], &hash, code)
                 }
                 Item::Code(_) => out.push_code(ItemStatus::Absent, &[]),
+                Item::Header { .. } => out.push_header(ItemStatus::Absent, &[]),
+                Item::Transactions { .. } => {
+                    out.push_transactions(ItemStatus::Absent, std::iter::empty())
+                }
                 Item::Proof(_) => unreachable!("answered by answer_proof"),
             }
         }
