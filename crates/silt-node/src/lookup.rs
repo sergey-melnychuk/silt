@@ -20,18 +20,22 @@
 //! block transactions (op 6) are chain reads, not state reads: they run on
 //! the point-read pool, open no view and ignore the pin.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::{Address, B256, Bytes};
-use alloy_rlp::Encodable;
+use alloy_primitives::{Address, B256, Bytes, keccak256};
+use alloy_rlp::{EMPTY_STRING_CODE, Encodable};
 use reth_ethereum::provider::{
     BlockReader, ProviderError, StateProviderBox, StateProviderFactory, TransactionVariant,
 };
-use reth_ethereum::trie::{MultiProof, MultiProofTargets};
+use reth_ethereum::trie::{
+    BranchNodeRef, DecodedMultiProofV2, EMPTY_ROOT_HASH, MultiProof, MultiProofTargetsV2, Nibbles,
+    ProofTrieNodeV2, ProofV2Target, ProofV2TargetParent, TrieNodeV2,
+};
 use silt_wire::lookup::{
     self, FINALIZED, FrameWriter, Item, ItemStatus, MAX_INFLIGHT, MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES, Op, ProofBuilder, ProofTarget, RequestRef, ResponseBuilder, Status,
@@ -83,8 +87,9 @@ pub trait StateView {
     fn code(&self, code_hash: &Word) -> Result<Option<Bytes>, ReadError>;
     /// Multiproof for pre-hashed targets (D10), written into `out`: account
     /// trie nodes sorted by path, then storage tries sorted by hashed
-    /// address, each sorted by path ([`write_multiproof`] does this for
-    /// reth's `MultiProof`). Sources without proofs answer `Internal`.
+    /// address, each sorted by path ([`write_multiproof_v2`] does this for
+    /// reth's v2 proofs, [`write_multiproof`] for v1's `MultiProof`).
+    /// Sources without proofs answer `Internal`.
     fn proof<'a>(
         &self,
         targets: impl Iterator<Item = ProofTarget<'a>>,
@@ -176,26 +181,105 @@ impl StateView for RethView {
         Ok(code.map(|c| c.original_bytes()))
     }
 
-    /// reth's v1 `multiproof` (the same read as `silt_multiproof`, D8): a
-    /// sequential walk on this view's read transaction.
+    /// reth's `multiproof_v2`, written exactly as v1's `multiproof` (the
+    /// read `silt_multiproof` serves, D8) would write it: see
+    /// [`RethView::prove`].
     fn proof<'a>(
         &self,
         targets: impl Iterator<Item = ProofTarget<'a>>,
         out: &mut ProofBuilder,
     ) -> Result<(), ReadError> {
-        let mut wanted = MultiProofTargets::default();
-        for t in targets {
-            wanted
-                .entry(B256::from(*t.hashed_address))
-                .or_default()
-                .extend(t.slots().map(|s| B256::from(*s)));
-        }
+        let targets = ProofTargets::new(targets.map(|t| {
+            let slots: Vec<_> = t.slots().map(|s| B256::from(*s)).collect();
+            (B256::from(*t.hashed_address), slots)
+        }));
+        self.prove(&targets, out)
+    }
+}
+
+impl RethView {
+    /// One op-4 proof through reth's `multiproof_v2`. On a view with
+    /// executed but unpersisted blocks, v1 `multiproof` clones and re-sorts
+    /// the whole in-memory overlay on every call; v2 reads the overlay
+    /// reth's engine already built (shared per anchor and tip) through a
+    /// calculator this provider keeps, so a reused view (D9) pays that
+    /// once. The answer is byte-identical to [`write_multiproof`] of v1
+    /// for the same state and targets ([`write_multiproof_v2`]).
+    ///
+    /// `requires_masks = false`: only node RLP is written, never masks, and
+    /// `true` would build a second overlay (with trie changesets) that v1
+    /// never reads.
+    pub fn prove(&self, targets: &ProofTargets, out: &mut ProofBuilder) -> Result<(), ReadError> {
         let mp = self
             .0
-            .multiproof(Default::default(), wanted)
+            .multiproof_v2(targets.request(), false)
             .map_err(classify)?;
-        write_multiproof(&mp, out);
-        Ok(())
+        write_multiproof_v2(&mp, targets, out)
+    }
+}
+
+/// Proof targets as v1's `MultiProofTargets` holds them: each hashed
+/// address once (repeats merged), its hashed slots without repeats, all
+/// sorted.
+#[derive(Debug, Default)]
+pub struct ProofTargets {
+    /// Hashed addresses with their slots as nibble paths.
+    accounts: Vec<(B256, Vec<Nibbles>)>,
+    /// The addresses as nibble paths, in the same (sorted) order.
+    account_paths: Vec<Nibbles>,
+}
+
+impl ProofTargets {
+    /// `(hashed address, hashed slots)` pairs, in any order, repeats allowed.
+    pub fn new<S: IntoIterator<Item = B256>>(targets: impl IntoIterator<Item = (B256, S)>) -> Self {
+        let mut merged: BTreeMap<B256, Vec<Nibbles>> = BTreeMap::new();
+        for (hashed_address, slots) in targets {
+            merged
+                .entry(hashed_address)
+                .or_default()
+                .extend(slots.into_iter().map(Nibbles::unpack));
+        }
+        let accounts: Vec<_> = merged
+            .into_iter()
+            .map(|(hashed_address, mut slots)| {
+                slots.sort_unstable();
+                slots.dedup();
+                (hashed_address, slots)
+            })
+            .collect();
+        let account_paths = accounts.iter().map(|(a, _)| Nibbles::unpack(a)).collect();
+        Self {
+            accounts,
+            account_paths,
+        }
+    }
+
+    /// The v2 request: every address is an account target and a storage
+    /// target (no slots asks for the storage root node), as v1 proves the
+    /// storage trie of every target account that exists. v1 proves the
+    /// account trie's root even with no targets, which v2 answers with
+    /// nothing; one probe target makes v2 walk it, and the writer keeps
+    /// only the root of that walk.
+    fn request(&self) -> MultiProofTargetsV2 {
+        let target = |key_nibbles: Nibbles| ProofV2Target {
+            key_nibbles,
+            parent: ProofV2TargetParent::NONE,
+        };
+        let mut account_targets: Vec<_> = self.account_paths.iter().copied().map(target).collect();
+        if account_targets.is_empty() {
+            account_targets.push(ProofV2Target::new(B256::ZERO));
+        }
+        let storage_targets = self
+            .accounts
+            .iter()
+            .map(|(hashed_address, slots)| {
+                (*hashed_address, slots.iter().copied().map(target).collect())
+            })
+            .collect();
+        MultiProofTargetsV2 {
+            account_targets,
+            storage_targets,
+        }
     }
 }
 
@@ -218,6 +302,125 @@ pub fn write_multiproof(mp: &MultiProof, out: &mut ProofBuilder) {
             out.push_storage_node(path.len(), &path.pack(), rlp);
         }
     }
+}
+
+/// Writes reth's `multiproof_v2` answer for `targets` into an op-4 answer,
+/// byte-identical to [`write_multiproof`] of v1's `multiproof` for the same
+/// state and targets. Where the two differ:
+///
+/// - **Which nodes.** v1 keeps every node it builds whose path is the root
+///   or a prefix of a target. v2 merges an extension with its child branch
+///   into one node at the extension's path; v1 has both, the branch only
+///   when its own path is a prefix of a target. Every v2 node is checked
+///   against the same rule ([`v1_retains`]), which also drops the probe
+///   walk of an empty request ([`ProofTargets::request`]).
+/// - **Order.** v2 lists nodes children first; D10 sorts them by path.
+/// - **Storage roots.** v2 carries none: the root is the keccak of the
+///   root node's RLP (`0x80` for an empty trie hashes to the empty root).
+/// - **Missing accounts.** v1 answers an account that does not exist with
+///   an empty storage trie (`[0x80]` at the root) without reading its
+///   storage; here the account exists iff its leaf is in the account proof.
+pub fn write_multiproof_v2(
+    mp: &DecodedMultiProofV2,
+    targets: &ProofTargets,
+    out: &mut ProofBuilder,
+) -> Result<(), ReadError> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut existing = Vec::new();
+    write_trie(
+        &mp.account_proofs,
+        &targets.account_paths,
+        &mut buf,
+        |path, rlp| out.push_account_node(path.len(), &path.pack(), rlp),
+    )?;
+    for node in &mp.account_proofs {
+        if let TrieNodeV2::Leaf(leaf) = &node.node {
+            let key = node.path.join(&leaf.key);
+            if key.len() == 64 {
+                existing.push(B256::from_slice(&key.pack()));
+            }
+        }
+    }
+    existing.sort_unstable();
+    for (hashed_address, slots) in &targets.accounts {
+        let nodes = match mp.storage_proofs.get(hashed_address) {
+            Some(nodes) if existing.binary_search(hashed_address).is_ok() => nodes,
+            Some(_) => {
+                out.begin_storage(&hashed_address.0, &EMPTY_ROOT_HASH.0);
+                out.push_storage_node(0, &[], &[EMPTY_STRING_CODE]);
+                continue;
+            }
+            None => {
+                return Err(ReadError::Other(format!(
+                    "multiproof_v2 has no storage proof for {hashed_address}"
+                )));
+            }
+        };
+        let root = nodes.iter().find(|n| n.path.is_empty()).ok_or_else(|| {
+            ReadError::Other(format!(
+                "multiproof_v2 has no storage root node for {hashed_address}"
+            ))
+        })?;
+        buf.clear();
+        root.node.encode(&mut buf);
+        out.begin_storage(&hashed_address.0, &keccak256(&buf).0);
+        write_trie(nodes, slots, &mut buf, |path, rlp| {
+            out.push_storage_node(path.len(), &path.pack(), rlp)
+        })?;
+    }
+    Ok(())
+}
+
+/// Writes one trie's v2 nodes as v1 keeps them, sorted by path: a merged
+/// extension + branch is written as the extension, then (if v1 keeps it)
+/// the branch, which sorts right after it, since no other node's path
+/// lies between the two.
+fn write_trie(
+    nodes: &[ProofTrieNodeV2],
+    targets: &[Nibbles],
+    buf: &mut Vec<u8>,
+    mut push: impl FnMut(&Nibbles, &[u8]),
+) -> Result<(), ReadError> {
+    let mut kept: Vec<_> = nodes
+        .iter()
+        .filter(|n| v1_retains(targets, &n.path))
+        .collect();
+    kept.sort_unstable_by_key(|n| n.path);
+    for n in kept {
+        buf.clear();
+        n.node.encode(buf);
+        push(&n.path, buf);
+        match &n.node {
+            TrieNodeV2::Branch(branch) if !branch.key.is_empty() => {
+                let path = n.path.join(&branch.key);
+                if v1_retains(targets, &path) {
+                    buf.clear();
+                    BranchNodeRef::new(&branch.stack, branch.state_mask).encode(buf);
+                    push(&path, buf);
+                }
+            }
+            // An extension whose branch v2 left hashed: v1 never keeps that
+            // branch either, unless it leads to a target, which v2 always
+            // reveals. Refuse rather than answer short.
+            TrieNodeV2::Extension(ext) if v1_retains(targets, &n.path.join(&ext.key)) => {
+                return Err(ReadError::Other(format!(
+                    "multiproof_v2 left the branch below {:?} hashed",
+                    n.path
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// v1's rule for keeping a node (alloy-trie's `ProofRetainer::matches`):
+/// the root, or a prefix of a target. `targets` sorted.
+fn v1_retains(targets: &[Nibbles], path: &Nibbles) -> bool {
+    path.is_empty()
+        || targets
+            .get(targets.partition_point(|t| t < path))
+            .is_some_and(|t| t.starts_with(path))
 }
 
 /// How long an opened view of one block is reused (PLAN M6). A simulation
@@ -1886,5 +2089,617 @@ mod tests {
         let err = server_error(task).await;
         assert!(err.contains("timed out"), "{err}");
         drop(c);
+    }
+}
+
+/// v2 proofs (op 4) against v1 on a real reth provider: tries in MDBX plus
+/// blocks executed but not persisted, served through `BlockchainProvider`
+/// exactly as the node serves them.
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+    use alloy_primitives::U256;
+    use reth_chain_state::{ExecutedBlock, NewCanonicalChain};
+    use reth_ethereum::Block;
+    use reth_ethereum::chainspec::MAINNET;
+    use reth_ethereum::node::EthereumNode;
+    use reth_ethereum::node::api::NodeTypesWithDBAdapter;
+    use reth_ethereum::primitives::{Account, Header, RecoveredBlock, SealedHeader};
+    use reth_ethereum::provider::db::mdbx::DatabaseArguments;
+    use reth_ethereum::provider::db::{ClientVersion, DatabaseEnv, init_db};
+    use reth_ethereum::provider::providers::{
+        BlockchainProvider, ProviderFactory, RocksDBBuilder, StaticFileProvider,
+    };
+    use reth_ethereum::provider::{
+        BlockWriter, StageCheckpointWriter, StateRootProvider, StateWriter, TrieWriter,
+    };
+    use reth_ethereum::tasks::Runtime;
+    use reth_ethereum::trie::{HashedPostState, MultiProofTargets, SortedTrieData};
+    use reth_stages_types::{StageCheckpoint, StageId};
+    use std::path::PathBuf;
+
+    type Node = NodeTypesWithDBAdapter<EthereumNode, DatabaseEnv>;
+
+    /// One proof target: a hashed address and its hashed slots.
+    type Target = (B256, Vec<B256>);
+
+    /// A temp datadir, removed on drop (after the providers using it).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("silt-{tag}-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(dir.join("static_files")).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Deterministic xorshift64*.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn word(&mut self) -> B256 {
+            keccak256(self.next().to_be_bytes())
+        }
+    }
+
+    fn key(seed: u64) -> B256 {
+        keccak256(seed.to_be_bytes())
+    }
+
+    /// `prefix` bytes of `base`, then the rest of `tail`.
+    fn sharing(base: B256, prefix: usize, tail: B256) -> B256 {
+        let mut k = tail;
+        k.0[..prefix].copy_from_slice(&base.0[..prefix]);
+        k
+    }
+
+    fn account(nonce: u64, balance: u64, contract: bool) -> Account {
+        Account {
+            nonce,
+            balance: U256::from(balance),
+            bytecode_hash: contract.then(|| key(nonce ^ 0xc0de)),
+        }
+    }
+
+    /// Hashed keys picked for trie shapes v1 and v2 encode differently.
+    struct Shapes {
+        /// Two accounts sharing 9 bytes: an extension + branch deep in the
+        /// account trie.
+        ext_pair: [B256; 2],
+        /// Storage with two slots sharing 31 bytes (leaves and their
+        /// branch short enough to be inlined) plus 20 others.
+        inline: B256,
+        inline_slots: [B256; 2],
+        /// Storage of exactly two slots sharing 5 bytes: the root is an
+        /// extension over a branch.
+        root_ext: B256,
+        root_ext_slots: [B256; 2],
+        /// Storage of exactly one slot: the root is a leaf.
+        root_leaf: B256,
+        /// A contract destroyed in memory, one recreated with fresh
+        /// storage, one created in memory, an EOA deleted in memory.
+        destroyed: B256,
+        recreated: B256,
+        created: B256,
+        deleted: B256,
+        /// Never written anywhere; a slot never written anywhere.
+        missing: B256,
+        missing_slot: B256,
+    }
+
+    struct Chain {
+        provider: BlockchainProvider<Node>,
+        /// Block hashes by number: 0 persisted, the rest in memory.
+        hashes: Vec<B256>,
+        roots: Vec<B256>,
+        /// Every account ever written, with every slot ever written.
+        accounts: Vec<Target>,
+        shapes: Shapes,
+        _dir: TempDir,
+    }
+
+    /// Block 0 persisted (hashed state + tries in MDBX, Finish at 0), then
+    /// `in_memory` executed blocks with exact trie updates, committed to
+    /// the canonical in-memory state the way the engine does.
+    fn chain(in_memory: u64, db_accounts: u64, per_block: usize) -> Chain {
+        let dir = TempDir::new("proof");
+        let db = init_db(
+            dir.0.join("db"),
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .unwrap();
+        let static_files = StaticFileProvider::read_write(dir.0.join("static_files")).unwrap();
+        let rocksdb = RocksDBBuilder::new(dir.0.join("rocksdb"))
+            .with_default_tables()
+            .build()
+            .unwrap();
+        let factory = ProviderFactory::<Node>::new(
+            db,
+            MAINNET.clone(),
+            static_files,
+            rocksdb,
+            Runtime::test(),
+        )
+        .unwrap();
+
+        let mut rng = Rng(0x5eed);
+        let base = key(1_000_000);
+        let shapes = Shapes {
+            ext_pair: [base, sharing(base, 9, key(1_000_001))],
+            inline: key(1_000_002),
+            inline_slots: {
+                let s = key(1_000_003);
+                let mut t = s;
+                t.0[31] ^= 0x01;
+                [s, t]
+            },
+            root_ext: key(1_000_004),
+            root_ext_slots: [key(1_000_005), sharing(key(1_000_005), 5, key(1_000_006))],
+            root_leaf: key(1_000_007),
+            destroyed: key(3),
+            recreated: key(5),
+            created: key(2_000_000),
+            deleted: key(2),
+            missing: key(3_000_000),
+            missing_slot: key(3_000_001),
+        };
+        let mut accounts: BTreeMap<B256, Vec<B256>> = BTreeMap::new();
+
+        // Block 0: plain accounts, every 16th a contract with 30 slots.
+        let mut state = HashedPostState::default();
+        let mut set =
+            |state: &mut HashedPostState, a: B256, acct: Option<Account>, slots: &[(B256, u64)]| {
+                state.accounts.insert(a, acct);
+                let written = accounts.entry(a).or_default();
+                // reth 2.11's hashed state has no "wiped" flag: destroying an
+                // account (or recreating `shapes.recreated` with one new slot)
+                // zeroes every slot it ever had.
+                let wipe: Vec<_> = if acct.is_none() || a == shapes.recreated && slots.len() == 1 {
+                    written.iter().map(|s| (*s, 0)).collect()
+                } else {
+                    vec![]
+                };
+                if !slots.is_empty() || !wipe.is_empty() {
+                    let storage = state.storages.entry(a).or_default();
+                    for (slot, value) in wipe.iter().chain(slots) {
+                        storage.storage.insert(*slot, U256::from(*value));
+                        written.push(*slot);
+                    }
+                }
+            };
+        for i in 0..db_accounts {
+            let contract = i % 16 == 3 || i == 5;
+            let slots: Vec<_> = if contract {
+                (0..30).map(|j| (key(i << 32 | j), 1 + j)).collect()
+            } else {
+                vec![]
+            };
+            set(
+                &mut state,
+                key(i),
+                Some(account(i, 1 + i, contract)),
+                &slots,
+            );
+        }
+        for a in shapes.ext_pair {
+            set(&mut state, a, Some(account(7, 7, false)), &[]);
+        }
+        let mut inline_slots: Vec<_> = (0..20).map(|j| (key(4_000_000 + j), 1 + j)).collect();
+        // Value 1: each leaf is 3 bytes, their branch about 23.
+        inline_slots.extend(shapes.inline_slots.map(|s| (s, 1)));
+        set(
+            &mut state,
+            shapes.inline,
+            Some(account(1, 1, true)),
+            &inline_slots,
+        );
+        let root_ext_slots = shapes.root_ext_slots.map(|s| (s, 0xffff));
+        set(
+            &mut state,
+            shapes.root_ext,
+            Some(account(1, 1, true)),
+            &root_ext_slots,
+        );
+        set(
+            &mut state,
+            shapes.root_leaf,
+            Some(account(1, 1, true)),
+            &[(key(5_000_000), 9)],
+        );
+
+        let rw = factory.provider_rw().unwrap();
+        rw.write_hashed_state(&state.into_sorted()).unwrap();
+        rw.commit().unwrap();
+        // No trie nodes yet: the walk hashes every leaf and returns every
+        // branch node as an update.
+        let (root, updates) = factory
+            .latest()
+            .unwrap()
+            .state_root_with_updates(HashedPostState::default())
+            .unwrap();
+        let genesis = Block {
+            header: Header {
+                number: 0,
+                state_root: root,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let genesis = RecoveredBlock::new_unhashed(genesis, vec![]);
+        let rw = factory.provider_rw().unwrap();
+        rw.insert_block(&genesis).unwrap();
+        rw.write_trie_updates(updates).unwrap();
+        rw.save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(0))
+            .unwrap();
+        rw.commit().unwrap();
+
+        let provider = BlockchainProvider::new(factory).unwrap();
+        let in_mem = provider.canonical_in_memory_state();
+        let mut hashes = vec![genesis.hash()];
+        let mut roots = vec![root];
+        let contracts: Vec<u64> = (4..db_accounts).filter(|i| i % 16 == 3).collect();
+        for number in 1..=in_memory {
+            let mut state = HashedPostState::default();
+            for _ in 0..per_block {
+                let i = rng.below(db_accounts as usize) as u64;
+                // Keys 2, 3, 5 are the deleted/destroyed/recreated shapes.
+                if matches!(i, 2 | 3 | 5) {
+                    continue;
+                }
+                let contract = i % 16 == 3 || i == 5;
+                set(
+                    &mut state,
+                    key(i),
+                    Some(account(i + number, rng.next() >> 8, contract)),
+                    &[],
+                );
+            }
+            for j in 0..per_block / 10 {
+                set(
+                    &mut state,
+                    key(10_000_000 + number * 1000 + j as u64),
+                    Some(account(0, 1, false)),
+                    &[],
+                );
+            }
+            for _ in 0..per_block / 10 {
+                let i = contracts[rng.below(contracts.len())];
+                let mut slots: Vec<_> = (0..5).map(|_| (rng.word(), rng.next() >> 1)).collect();
+                // Rewrite two existing slots, zero (delete) one.
+                slots.push((key(i << 32 | rng.below(30) as u64), number));
+                slots.push((key(i << 32 | rng.below(30) as u64), 0));
+                set(
+                    &mut state,
+                    key(i),
+                    Some(account(i + number, 1, true)),
+                    &slots,
+                );
+            }
+            match number {
+                2 => {
+                    set(&mut state, shapes.destroyed, None, &[]);
+                }
+                3 => {
+                    let slots: Vec<_> = (0..12).map(|j| (key(6_000_000 + j), 1 + j)).collect();
+                    set(
+                        &mut state,
+                        shapes.created,
+                        Some(account(1, 1, true)),
+                        &slots,
+                    );
+                    set(&mut state, shapes.deleted, None, &[]);
+                }
+                4 => {
+                    // Wiped, then written: only the new slot remains.
+                    let acct = Some(account(0, 1, true));
+                    set(&mut state, shapes.recreated, acct, &[(key(7_000_000), 3)]);
+                }
+                5 => {
+                    // A slot in the inline region changes value.
+                    set(
+                        &mut state,
+                        shapes.inline,
+                        Some(account(2, 1, true)),
+                        &[(shapes.inline_slots[0], 2)],
+                    );
+                }
+                _ => {}
+            }
+            let parent = *hashes.last().unwrap();
+            let (root, updates) = provider
+                .state_by_block_hash(parent)
+                .unwrap()
+                .state_root_with_updates(state.clone())
+                .unwrap();
+            let block = Block {
+                header: Header {
+                    number,
+                    parent_hash: parent,
+                    state_root: root,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let block = RecoveredBlock::new_unhashed(block, vec![]);
+            hashes.push(block.hash());
+            roots.push(root);
+            let header = SealedHeader::new(block.header().clone(), block.hash());
+            let executed = ExecutedBlock::new(
+                Arc::new(block),
+                ExecutedBlock::<reth_ethereum::EthPrimitives>::default().execution_output,
+                SortedTrieData::new(
+                    Arc::new(state.into_sorted()),
+                    Arc::new(updates.into_sorted()),
+                ),
+            );
+            in_mem.update_chain(NewCanonicalChain::Commit {
+                new: vec![executed],
+            });
+            in_mem.set_canonical_head(header);
+        }
+        let accounts = accounts.into_iter().collect();
+        Chain {
+            provider,
+            hashes,
+            roots,
+            accounts,
+            shapes,
+            _dir: dir,
+        }
+    }
+
+    fn view(chain: &Chain, number: usize) -> RethView {
+        RethView(
+            chain
+                .provider
+                .state_by_block_hash(chain.hashes[number])
+                .unwrap(),
+        )
+    }
+
+    fn v1(view: &RethView, targets: &[Target]) -> (MultiProof, Vec<u8>) {
+        let mut wanted = MultiProofTargets::default();
+        for (a, slots) in targets {
+            wanted.entry(*a).or_default().extend(slots.iter().copied());
+        }
+        let mp = view.0.multiproof(Default::default(), wanted).unwrap();
+        let mut out = ProofBuilder::new(0, 1, 0, &[0; 32], 0);
+        write_multiproof(&mp, &mut out);
+        (mp, out.finish(0))
+    }
+
+    fn v2(view: &RethView, targets: &[Target]) -> Vec<u8> {
+        let targets = ProofTargets::new(targets.iter().cloned());
+        let mut out = ProofBuilder::new(0, 1, 0, &[0; 32], 0);
+        view.prove(&targets, &mut out).unwrap();
+        out.finish(0)
+    }
+
+    /// Target sets covering every case the two writers could disagree on.
+    fn target_sets(chain: &Chain) -> Vec<(&'static str, Vec<Target>)> {
+        let s = &chain.shapes;
+        let all = &chain.accounts;
+        let mut rng = Rng(0xfeed);
+        let with_slots = |a: B256| -> Vec<B256> {
+            all.iter()
+                .find(|(k, _)| *k == a)
+                .map(|(_, slots)| slots.clone())
+                .unwrap_or_default()
+        };
+        let mut mixed: Vec<Target> = (0..40)
+            .map(|_| {
+                let (a, slots) = &all[rng.below(all.len())];
+                let take = rng.below(4);
+                (*a, slots.iter().take(take).copied().collect())
+            })
+            .collect();
+        mixed.push((s.missing, vec![s.missing_slot]));
+        mixed.push((s.ext_pair[0], vec![]));
+        let mut inline_slots = s.inline_slots.to_vec();
+        // Absent, but inside the inline branch / beside the root extension.
+        let mut near = s.inline_slots[0];
+        near.0[31] ^= 0x02;
+        inline_slots.push(near);
+        let mut beside = s.root_ext_slots[0];
+        beside.0[3] ^= 0x10;
+        vec![
+            ("empty request", vec![]),
+            ("one account, no slots", vec![(all[0].0, vec![])]),
+            (
+                "account trie extension pair",
+                s.ext_pair.iter().map(|a| (*a, vec![])).collect(),
+            ),
+            ("one of the extension pair", vec![(s.ext_pair[1], vec![])]),
+            (
+                "beside the extension pair",
+                vec![(sharing(s.ext_pair[0], 6, key(9)), vec![])],
+            ),
+            (
+                "missing account, missing slot",
+                vec![(s.missing, vec![s.missing_slot])],
+            ),
+            (
+                "existing account, missing slot",
+                vec![(all[1].0, vec![s.missing_slot])],
+            ),
+            ("contract, no slots", vec![(key(3 + 16), vec![])]),
+            (
+                "contract, all slots",
+                vec![(key(3 + 16), with_slots(key(3 + 16)))],
+            ),
+            ("inline nodes", vec![(s.inline, inline_slots)]),
+            ("inline storage, no slots", vec![(s.inline, vec![])]),
+            (
+                "storage root extension, no slots",
+                vec![(s.root_ext, vec![])],
+            ),
+            (
+                "storage root extension, one slot",
+                vec![(s.root_ext, vec![s.root_ext_slots[1]])],
+            ),
+            (
+                "beside the storage root extension",
+                vec![(s.root_ext, vec![beside])],
+            ),
+            (
+                "storage root leaf",
+                vec![(s.root_leaf, vec![key(5_000_000), s.missing_slot])],
+            ),
+            (
+                "destroyed in memory",
+                vec![(s.destroyed, with_slots(s.destroyed))],
+            ),
+            (
+                "recreated in memory",
+                vec![(s.recreated, with_slots(s.recreated))],
+            ),
+            (
+                "created in memory",
+                vec![(s.created, with_slots(s.created))],
+            ),
+            ("deleted in memory", vec![(s.deleted, vec![s.missing_slot])]),
+            (
+                "repeats",
+                vec![
+                    (s.inline, vec![s.inline_slots[0]]),
+                    (s.inline, vec![s.inline_slots[0], s.inline_slots[1]]),
+                    (s.missing, vec![]),
+                    (s.missing, vec![]),
+                ],
+            ),
+            ("mixed", mixed),
+        ]
+    }
+
+    /// v2 node shapes the writer re-encodes, counted so the test is known
+    /// to cover each.
+    #[derive(Debug, Default)]
+    struct Seen {
+        /// Extension + branch merged into one v2 node.
+        merged: usize,
+        /// Nodes under 32 bytes of RLP (inlined in their parent).
+        inline: usize,
+        /// Storage tries whose root is an extension.
+        root_extension: usize,
+        /// Empty storage tries.
+        empty_storage: usize,
+    }
+
+    impl Seen {
+        fn count(&mut self, view: &RethView, targets: &[Target]) {
+            let targets = ProofTargets::new(targets.iter().cloned());
+            let mp = view.0.multiproof_v2(targets.request(), false).unwrap();
+            let storage = mp.storage_proofs.values().flatten();
+            for n in mp.account_proofs.iter().chain(storage) {
+                match &n.node {
+                    TrieNodeV2::Branch(b) if !b.key.is_empty() => self.merged += 1,
+                    _ => {}
+                }
+                if !n.path.is_empty() && alloy_rlp::encode(&n.node).len() < 32 {
+                    self.inline += 1;
+                }
+            }
+            for nodes in mp.storage_proofs.values() {
+                match &nodes.iter().find(|n| n.path.is_empty()).unwrap().node {
+                    TrieNodeV2::Branch(b) if !b.key.is_empty() => self.root_extension += 1,
+                    TrieNodeV2::EmptyRoot => self.empty_storage += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v2_proofs_are_byte_identical_to_v1_over_unpersisted_blocks() {
+        let chain = chain(6, 600, 60);
+        let mut seen = Seen::default();
+        for number in [0, 3, 6] {
+            let view = view(&chain, number);
+            for (name, targets) in target_sets(&chain) {
+                let (mp, want) = v1(&view, &targets);
+                // The view reads block `number`, in-memory blocks included.
+                let root = mp.account_subtree.get(&Nibbles::default()).unwrap();
+                assert_eq!(
+                    keccak256(root),
+                    chain.roots[number],
+                    "block {number}, {name}"
+                );
+                let got = v2(&view, &targets);
+                assert!(
+                    want == got,
+                    "block {number}, {name}: v2 answer differs from v1"
+                );
+                seen.count(&view, &targets);
+            }
+        }
+        assert!(
+            seen.merged > 0 && seen.inline > 0 && seen.root_extension > 0 && seen.empty_storage > 0,
+            "{seen:?}"
+        );
+    }
+
+    /// Not an assertion on time: per-call proof time, v1 vs v2, with 15
+    /// blocks of 2000 account writes in memory. About 20 s unoptimized:
+    /// `cargo test -p silt-node proof_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing printout; run explicitly"]
+    fn proof_time_v1_vs_v2_with_15_blocks_in_memory() {
+        let chain = chain(15, 20_000, 2000);
+        let mut rng = Rng(0xbeef);
+        let all = &chain.accounts;
+        let requests: Vec<Vec<Target>> = (0..50)
+            .map(|_| {
+                (0..8)
+                    .map(|_| {
+                        let (a, slots) = &all[rng.below(all.len())];
+                        (*a, slots.iter().take(2).copied().collect())
+                    })
+                    .collect()
+            })
+            .collect();
+        let tip = chain.hashes.len() - 1;
+        let view = view(&chain, tip);
+        for r in &requests {
+            assert!(v1(&view, r).1 == v2(&view, r), "v2 answer differs from v1");
+        }
+        let time = |f: &dyn Fn(&[Target])| {
+            f(&requests[0]);
+            let started = Instant::now();
+            for r in &requests {
+                f(r);
+            }
+            started.elapsed() / requests.len() as u32
+        };
+        let t1 = time(&|r| {
+            v1(&view, r);
+        });
+        let t2 = time(&|r| {
+            v2(&view, r);
+        });
+        let t2_fresh = time(&|r| {
+            v2(&self::view(&chain, tip), r);
+        });
+        println!(
+            "proof per call, 8 accounts x 2 slots, 15 blocks in memory: \
+             v1 {t1:?}, v2 (reused view) {t2:?}, v2 (fresh view) {t2_fresh:?}"
+        );
     }
 }

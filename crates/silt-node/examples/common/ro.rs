@@ -43,8 +43,8 @@ pub struct ReadOnly {
 }
 
 /// reth's `Runtime` with every rayon pool at one thread: point lookups and
-/// the sequential v1 multiproof walk use none of them (sizing verified at
-/// the pinned rev, docs/reth-notes.md).
+/// the sequential multiproof walks (v1, v2) use none of them (sizing
+/// verified at the pinned rev, docs/reth-notes.md).
 pub fn minimal_runtime(handle: tokio::runtime::Handle) -> eyre::Result<Runtime> {
     let config = RuntimeConfig::default()
         .with_tokio(TokioConfig::existing_handle(handle))

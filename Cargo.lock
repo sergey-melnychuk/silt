@@ -10921,6 +10921,7 @@ dependencies = [
  "futures",
  "jsonrpsee",
  "libc",
+ "reth-chain-state",
  "reth-ethereum",
  "reth-stages-types",
  "serde",

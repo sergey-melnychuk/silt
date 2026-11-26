@@ -23,7 +23,8 @@
 //! Checks (any failure exits 1): keccak(root node) equals the pinned
 //! header's state root, in-process and over RPC; every op-4 answer is
 //! **byte-identical** (header, every node, every storage trie) to
-//! `write_multiproof` of the in-process walk at the same pin.
+//! `write_multiproof` of the in-process walk at the same pin. Op 4 reads
+//! `multiproof_v2` and the walk is v1, so this also checks v2 against v1.
 //!
 //! Workloads (pre-hashed targets from the last `--blocks` blocks'
 //! changesets, each proved at the frontier current at the time):
@@ -383,8 +384,8 @@ fn small_workloads(blocks: &[Targets], n: usize) -> Vec<(&'static str, Vec<Targe
     vec![("acct-1", acct1), ("slot-1", slot1), ("acct-64", acct64)]
 }
 
-/// Open + multiproof in-process at `pin`: exactly the servers' blocking
-/// section, on the harness's read-only provider.
+/// Open + v1 multiproof in-process at `pin`: `silt_multiproof`'s blocking
+/// section (op 4 reads v2), on the harness's read-only provider.
 fn walk_at(ro: &ro::ReadOnly, pin: B256, targets: &Targets) -> eyre::Result<(MultiProof, f64)> {
     let start = Instant::now();
     let provider = ro.factory.provider()?;

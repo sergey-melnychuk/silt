@@ -117,7 +117,8 @@ tables, `NIPPY_JAR_VERSION` 1 and the reth-core codecs pin are unchanged.)
   `StateProviderFactory::latest()` / `state_by_block_hash()`
   (`crates/storage/storage-api/src/state.rs:156,199`). 2.8 adds a
   `multiproof_v2` (`trie.rs:174`, `MultiProofTargetsV2` →
-  `DecodedMultiProofV2`) — silt stays on v1. `MultiProofTargets` is a
+  `DecodedMultiProofV2`) — `silt_multiproof` stays on v1; op 4 reads v2
+  (see "Proof op facts"). `MultiProofTargets` is a
   newtype over `B256Map<B256Set>` (hashed-address → hashed-slot set) and
   derefs to the map via derive_more (`crates/trie/common/src/proofs.rs:23`).
 - **Historical blocks work**: reworked in 2.8 —
@@ -247,9 +248,34 @@ behavior is unchanged.
 ## Proof op facts (T5 VERIFY, D10)
 
 Verified at `46731e9`, re-checked at v2.11.0, for op `Proof = 4` (`silt-node/src/lookup.rs`:
-`RethView::proof`, `write_multiproof`) and `examples/proof-bench.rs`.
+`RethView::prove`, `write_multiproof_v2`, `write_multiproof`) and `examples/proof-bench.rs`.
 
-- **The read**: `StateProofProvider::multiproof(&self, TrieInput,
+- **Op 4 reads v2, answers as v1.** With blocks executed but not
+  persisted, the overlay provider's v1 `multiproof` (`provider.rs:765`)
+  clones the sorted in-memory overlay back to unsorted form and re-sorts
+  it on every call (mainnet: p50 0.30 ms → 19 ms, the proof threads ~73%
+  of the node's CPU). `multiproof_v2(targets, requires_masks)`
+  (`provider.rs:783`) reads the cached `state_trie_overlay` (per anchor
+  and tip) through an `OverlayMultiProofCalculator` the provider keeps,
+  so a reused view pays it once. `requires_masks = false` reads the same
+  overlay as v1 (`true` builds one with trie changesets). The answer
+  stays byte-identical to v1's (`proof_tests` in `lookup.rs`):
+  - v2 merges an extension and its child branch into one
+    `BranchNodeV2 { key, .. }` that encodes as the extension; v1 keeps
+    both, the branch only when its path is a prefix of a target. The
+    writer splits them and applies v1's rule (`ProofRetainer::matches`:
+    the root, or a prefix of a target) to every node.
+  - v2 lists nodes children first; op 4 sorts by path.
+  - v2 has no storage roots: the root is the keccak of the root node's
+    RLP (`0x80` hashes to the empty root).
+  - v1 gives an account that does not exist an empty storage trie
+    (`StorageMultiProof::empty()`: root `0x80`); v2 would read its
+    storage. The writer checks for the account's leaf in the account proof.
+  - v2 answers no targets with nothing; v1 with the account root. An
+    empty request probes one key and keeps only the root (op 4 never
+    sends one: `prove` skips empty frames).
+- **The v1 read** (still `silt_multiproof`, and proof-bench's reference):
+  `StateProofProvider::multiproof(&self, TrieInput,
   MultiProofTargets) -> ProviderResult<MultiProof>`
   (`crates/storage/storage-api/src/trie.rs:159`), the same call as
   `silt_multiproof` (D8). `MultiProof { account_subtree: ProofNodes,
@@ -257,7 +283,7 @@ Verified at `46731e9`, re-checked at v2.11.0, for op `Proof = 4` (`silt-node/src
   (`crates/trie/common/src/proofs.rs:184`); `StorageMultiProof { root,
   subtree, branch_node_masks }` (`:689`). Op 4 carries `account_subtree`
   and each storage trie's `root` + `subtree`; the masks are dropped, as in
-  D8. `multiproof_v2` (`trie.rs:174`) is left for later.
+  D8.
 - **On the overlay provider** (`crates/storage/storage-overlay/src/provider.rs:765`)
   it builds the revert overlay (`build_overlay`, `:352`), then runs one
   sequential `DbProof::overlay_multiproof` on the view's own read
