@@ -69,12 +69,16 @@ impl yevm::Chain for Cache {
         Ok(Account {
             value: int(&view.balance),
             nonce: Int::from(view.nonce),
-            code: (Buf::from(view.code.to_vec()), int(&view.code_hash)),
+            code: (view.code.to_vec().into(), int(&view.code_hash)),
         })
     }
 
+    // `into`: an account's code is a `Buf` in yevm main and a shared `Code` in its newer
+    // revisions; this builds against both (against main the conversion does nothing).
+    #[allow(clippy::useless_conversion)]
     async fn code(&self, acc: &Acc) -> eyre::Result<(Buf, Int)> {
-        Ok(yevm::Chain::acc(self, acc).await?.code)
+        let (code, hash) = yevm::Chain::acc(self, acc).await?.code;
+        Ok((code.into(), hash))
     }
 
     async fn nonce(&self, acc: &Acc) -> eyre::Result<u64> {
